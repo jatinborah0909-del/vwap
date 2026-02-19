@@ -2,36 +2,41 @@
 # -*- coding: utf-8 -*-
 
 """
-VWAP Straddle Strategy — Kite (data) + Stocko (orders)
-======================================================
+VWAP Straddle Strategy — Kite (data) + Stocko (orders) + Railway Postgres
+==========================================================================
 
-UPDATED (as requested)
-----------------------
-✅ Track CURRENT week expiry + NEXT week expiry VWAP
-✅ VWAP starts from configurable time (default 09:15 IST)
-✅ Prelock: build VWAP for ATM(09:15) ± N strikes (configurable, default N=5)
-✅ Freeze ATM at configurable time (default 09:30 IST)
-✅ At freeze, decide which expiry to TRADE:
-    - If CURRENT-week ATM straddle premium > PREMIUM_SWITCH_TH  -> trade CURRENT week
-    - Else                                                     -> trade NEXT week
-✅ After freeze: maintain ONLY chosen expiry + chosen strike (no other VWAP calculations)
-✅ Hard stop if frozen ATM is outside prelock range (do nothing further)
+v2 CHANGES
+----------
+✅ Crossover-based entry:
+   - Straddle must CLOSE ABOVE vwap first  (arms the trigger)
+   - Then CLOSE BELOW vwap                 (entry fires — both legs SELL)
+   - Simple "below vwap" alone is NOT enough
 
-Entry/Exit remains same:
-- Entry when straddle_LTP < VWAP  (implemented via: vwap-ENTRY_WINDOW_BELOW <= ltp <= vwap)
-- Exit  when straddle_LTP > VWAP  (implemented via: ltp > vwap + EXIT_WINDOW_ABOVE)
+✅ Per-leg exit management:
+   - Exit signal (straddle > vwap + EXIT_WINDOW_ABOVE): close ONLY the loss-making leg
+   - Profit leg stays open and continues running
+   - If remaining single leg causes total PnL <= MAX_LOSS_LIMIT -> hard stop that leg too
+
+✅ Re-entry logic:
+   - One leg closed (partial exit): straddle crosses below vwap -> re-add the closed leg
+   - Both legs closed (not hard-stopped): straddle crosses below vwap -> re-enter both legs
+   - Re-entry still requires the above->below crossover; bare "below vwap" alone won't trigger
+
+✅ Railway / Postgres logging (unchanged)
+✅ Kill switch: trade_flag.live_nifty_vwap — now handles per-leg open positions
+✅ EOD force-close of any open legs
+
+PRELOCK (unchanged)
+-------------------
+✅ Track CURRENT week + NEXT week expiry VWAP from VWAP_START
+✅ ATM fixed at VWAP_START spot price; track ±PRELOCK_WING_STRIKES strikes
+✅ At ATM_FREEZE_TIME: decide expiry (curr prem > PREMIUM_SWITCH_TH -> curr, else next)
+✅ Hard stop if frozen ATM outside prelock range
 
 LIVE vs PAPER
 -------------
-- TRADE_MODE=PAPER  -> NO real orders are placed (only logs/prints)
-- TRADE_MODE=LIVE   -> Orders go via Stocko API
-
-PRODUCTION ADDITIONS
---------------------
-✅ All logs go to Postgres (Railway DATABASE_URL) instead of CSV
-✅ Auto-create tables on first run
-✅ Kill switch: trade_flag.live_nifty_vwap
-   - If FALSE: square-off open position (if any) + exit
+- TRADE_MODE=PAPER  -> NO real orders (only logs)
+- TRADE_MODE=LIVE   -> Orders via Stocko API
 """
 
 import os
@@ -48,42 +53,39 @@ from kiteconnect import KiteConnect, exceptions as kite_exceptions
 # CONFIGURATION
 # ============================================================
 
-# --- TRADE MODE ---
 TRADE_MODE = os.getenv("TRADE_MODE", "PAPER").upper()
 if TRADE_MODE not in ("PAPER", "LIVE"):
     raise ValueError("TRADE_MODE must be PAPER or LIVE")
 print(f"[MODE] Running in {TRADE_MODE} mode")
 
-# --- Kite config (data) ---
-API_KEY = os.getenv("KITE_API_KEY", "").strip()
+# --- Kite config ---
+API_KEY      = os.getenv("KITE_API_KEY", "").strip()
 ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN", "").strip()
-
-#API_KEY = "9qfecm39l1j64xyc"
-#ACCESS_TOKEN = "w0oFr0nxovmuAmJU0Fv4gG0IHeND661k"
 
 if not API_KEY or not ACCESS_TOKEN:
     raise RuntimeError("Missing KITE_API_KEY or KITE_ACCESS_TOKEN")
 
-# --- Stocko config (orders) ---
+# --- Stocko config ---
 STOCKO_BASE_URL     = os.getenv("STOCKO_BASE_URL", "https://api.stocko.in").strip()
 STOCKO_ACCESS_TOKEN = os.getenv("STOCKO_ACCESS_TOKEN", "").strip()
 STOCKO_CLIENT_ID    = os.getenv("STOCKO_CLIENT_ID", "").strip()
 
-EXCH_OPT     = "NFO"
-INDEX_NAME   = "NIFTY"
-SPOT_TOKEN   = 256265
-STRIKE_STEP  = 50
+EXCH_OPT    = "NFO"
+SPOT_TOKEN  = 256265
+STRIKE_STEP = 50
 
-ENTRY_WINDOW_BELOW      = float(os.getenv("ENTRY_WINDOW_BELOW", "4.0"))
-EXIT_WINDOW_ABOVE       = float(os.getenv("EXIT_WINDOW_ABOVE", "2.0"))
-LOT_SIZE                = int(os.getenv("LOT_SIZE", "65"))
-MAX_LOSS_LIMIT          = float(os.getenv("MAX_LOSS_LIMIT", "-1700.0"))
-MAX_ENTRIES_PER_STRIKE  = int(os.getenv("MAX_ENTRIES_PER_STRIKE", "4"))
+EXIT_WINDOW_ABOVE      = float(os.getenv("EXIT_WINDOW_ABOVE",      "2.0"))
+LOT_SIZE               = int(os.getenv("LOT_SIZE",                 "65"))
+MAX_LOSS_LIMIT         = float(os.getenv("MAX_LOSS_LIMIT",         "-1700.0"))
+MAX_ENTRIES_PER_STRIKE = int(os.getenv("MAX_ENTRIES_PER_STRIKE",   "4"))
+PREMIUM_SWITCH_TH      = float(os.getenv("PREMIUM_SWITCH_TH",      "215.0"))
 
-# Premium switch threshold
-PREMIUM_SWITCH_TH       = float(os.getenv("PREMIUM_SWITCH_TH", "215.0"))
+# Once the loss leg is closed and only one leg is running solo,
+# close it if its LTP rises more than this many points above its entry price.
+# i.e. surviving leg is now losing: (current_ltp - entry_price) > SINGLE_LEG_SL
+# Set to 9999 to effectively disable.
+SINGLE_LEG_SL          = float(os.getenv("SINGLE_LEG_SL",           "10.0"))
 
-# --- TIME CONFIG (configurable) ---
 MARKET_TZ = pytz.timezone("Asia/Kolkata")
 
 def parse_hhmm(env_key: str, default_hhmm: str) -> dt_time:
@@ -92,15 +94,14 @@ def parse_hhmm(env_key: str, default_hhmm: str) -> dt_time:
         hh, mm = map(int, raw.split(":"))
         return dt_time(hh, mm)
     except Exception:
-        raise ValueError(f"{env_key} must be in HH:MM format (e.g. 09:15). Got: {raw}")
+        raise ValueError(f"{env_key} must be HH:MM. Got: {raw}")
 
-VWAP_START    = parse_hhmm("VWAP_COLLECTION_START", "09:49")
-ATM_LOCK_TIME = parse_hhmm("ATM_FREEZE_TIME", "09:55")
+VWAP_START    = parse_hhmm("VWAP_COLLECTION_START", "09:15")
+ATM_LOCK_TIME = parse_hhmm("ATM_FREEZE_TIME",       "09:30")
 
 if VWAP_START >= ATM_LOCK_TIME:
     raise ValueError("VWAP_COLLECTION_START must be earlier than ATM_FREEZE_TIME")
 
-# --- PRELOCK STRIKE RANGE (configurable) ---
 PRELOCK_WING_STRIKES = int(os.getenv("PRELOCK_WING_STRIKES", "6"))
 if PRELOCK_WING_STRIKES <= 0:
     raise ValueError("PRELOCK_WING_STRIKES must be > 0")
@@ -111,7 +112,6 @@ print(f"[CONFIG] VWAP_COLLECTION_START={VWAP_START}")
 print(f"[CONFIG] ATM_FREEZE_TIME={ATM_LOCK_TIME}")
 print(f"[CONFIG] PRELOCK_WING_STRIKES=±{PRELOCK_WING_STRIKES}")
 
-# If LIVE mode, enforce Stocko creds
 if TRADE_MODE == "LIVE":
     if not STOCKO_ACCESS_TOKEN:
         raise RuntimeError("LIVE mode requires STOCKO_ACCESS_TOKEN")
@@ -132,7 +132,6 @@ def get_conn():
 def init_db():
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # Create log tables
             cur.execute("""
             CREATE TABLE IF NOT EXISTS nifty_vwap_minute (
                 id BIGSERIAL PRIMARY KEY,
@@ -155,6 +154,7 @@ def init_db():
             );
             """)
 
+            # v2: added leg, leg_entry, leg_exit_price columns
             cur.execute("""
             CREATE TABLE IF NOT EXISTS nifty_vwap_trade (
                 id BIGSERIAL PRIMARY KEY,
@@ -166,6 +166,9 @@ def init_db():
                 strike INTEGER,
                 action_price DOUBLE PRECISION,
                 vwap_at_action DOUBLE PRECISION,
+                leg TEXT,
+                leg_entry DOUBLE PRECISION,
+                leg_exit_price DOUBLE PRECISION,
                 pnl_realized DOUBLE PRECISION,
                 pnl_running DOUBLE PRECISION,
                 total_pnl DOUBLE PRECISION,
@@ -176,7 +179,17 @@ def init_db():
             );
             """)
 
-            # Ensure kill-switch table/column exists
+            # Add v2 columns to existing table if upgrading in place
+            for col, coltype in [
+                ("leg",           "TEXT"),
+                ("leg_entry",     "DOUBLE PRECISION"),
+                ("leg_exit_price","DOUBLE PRECISION"),
+            ]:
+                cur.execute(f"""
+                    ALTER TABLE nifty_vwap_trade
+                    ADD COLUMN IF NOT EXISTS {col} {coltype};
+                """)
+
             cur.execute("""
             CREATE TABLE IF NOT EXISTS trade_flag (
                 id BIGSERIAL PRIMARY KEY
@@ -186,8 +199,6 @@ def init_db():
             ALTER TABLE trade_flag
             ADD COLUMN IF NOT EXISTS live_nifty_vwap BOOLEAN DEFAULT TRUE;
             """)
-
-            # Ensure at least one row exists
             cur.execute("SELECT COUNT(*) FROM trade_flag;")
             if cur.fetchone()[0] == 0:
                 cur.execute("INSERT INTO trade_flag (live_nifty_vwap) VALUES (TRUE);")
@@ -195,23 +206,27 @@ def init_db():
         conn.commit()
 
 def is_kill_switch_on() -> bool:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT live_nifty_vwap FROM trade_flag ORDER BY id ASC LIMIT 1;")
-            row = cur.fetchone()
-            return bool(row[0]) if row and row[0] is not None else True
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT live_nifty_vwap FROM trade_flag ORDER BY id ASC LIMIT 1;")
+                row = cur.fetchone()
+                return bool(row[0]) if row and row[0] is not None else True
+    except Exception as e:
+        print(f"[WARN] Kill-switch DB read failed: {e} — assuming ON")
+        return True
 
 init_db()
-print("[DB] Tables ready (nifty_vwap_minute, nifty_vwap_trade, trade_flag).")
+print("[DB] Tables ready.")
 
 # ============================================================
-# BROKER INIT (Kite for data)
+# BROKER INIT
 # ============================================================
 kite = KiteConnect(api_key=API_KEY)
 kite.set_access_token(ACCESS_TOKEN)
 
 # ============================================================
-# SAFE QUOTE WRAPPER
+# SAFE QUOTE
 # ============================================================
 def safe_quote(keys, max_retries=5, base_sleep=1.0):
     for attempt in range(1, max_retries + 1):
@@ -226,7 +241,7 @@ def safe_quote(keys, max_retries=5, base_sleep=1.0):
         except kite_exceptions.InputException as e:
             print(f"[ERROR] quote input error, not retrying: {e}")
             raise
-    raise RuntimeError("safe_quote: too many failures calling kite.quote")
+    raise RuntimeError("safe_quote: too many failures")
 
 # ============================================================
 # TIME / UTILS
@@ -241,62 +256,9 @@ def nearest_50(x):
     return int(round(x / STRIKE_STEP) * STRIKE_STEP)
 
 # ============================================================
-# EXPIRY LOGIC (NIFTY Tuesday weekly + monthly)
-# ============================================================
-def get_nifty_expiries(today, holidays=None):
-    """
-    Returns:
-        weekly_expiry (next Tuesday >= today)
-        monthly_expiry (last working Tuesday of month)
-    """
-    if holidays is None:
-        holidays = set()
-
-    # Next Tuesday (Mon=0 Tue=1)
-    days_ahead = (1 - today.weekday()) % 7
-    next_tuesday = today + timedelta(days=days_ahead)
-    if next_tuesday < today:
-        next_tuesday += timedelta(days=7)
-
-    # Monthly: last working Tuesday
-    next_month_first = (today.replace(day=28) + timedelta(days=4)).replace(day=1)
-    last_day_this_month = next_month_first - timedelta(days=1)
-    offset = (last_day_this_month.weekday() - 1) % 7
-    monthly = last_day_this_month - timedelta(days=offset)
-
-    while monthly in holidays:
-        monthly -= timedelta(days=1)
-
-    # If next Tuesday equals monthly, weekly becomes previous Tuesday
-    if next_tuesday == monthly:
-        weekly = next_tuesday - timedelta(days=7)
-    else:
-        weekly = next_tuesday
-
-    if weekly < today:
-        weekly += timedelta(days=7)
-
-    return weekly, monthly
-
-def next_weekly_expiry(curr_weekly, holidays=None):
-    """Next weekly = curr_weekly + 7 days, adjusted if holiday list provided."""
-    if holidays is None:
-        holidays = set()
-    nxt = curr_weekly + timedelta(days=7)
-    while nxt in holidays:
-        nxt -= timedelta(days=1)
-    return nxt
-
-# ============================================================
-# ✅ HOLIDAY-SAFE EXPIRY PICKER (FROM INSTRUMENT DUMP)
+# EXPIRY HELPERS
 # ============================================================
 def pick_curr_next_weekly_from_instruments(instruments, today_date):
-    """
-    Holiday-safe approach:
-    - Uses the actual expiry dates present in Kite instrument dump for NIFTY options
-    - Picks the first two expiries >= today
-    - Handles Tuesday holiday -> expiry shifts to Monday.
-    """
     expiries = sorted({
         ins["expiry"].date() if hasattr(ins.get("expiry"), "date") else ins.get("expiry")
         for ins in instruments
@@ -304,11 +266,9 @@ def pick_curr_next_weekly_from_instruments(instruments, today_date):
         and str(ins.get("tradingsymbol", "")).startswith("NIFTY")
         and ins.get("expiry") is not None
     })
-
     future = [e for e in expiries if e >= today_date]
     if len(future) < 2:
         raise RuntimeError(f"Not enough future expiries in instrument dump (found {len(future)})")
-
     return future[0], future[1]
 
 # ============================================================
@@ -319,14 +279,9 @@ def get_spot_ltp():
     return list(q.values())[0]["last_price"]
 
 def load_instruments_nfo():
-    return kite.instruments(EXCH_OPT)
+    return kite.instruments("NFO")
 
 def build_opt_index(instruments):
-    """
-    Build a fast index:
-        key = (expiry_date, strike_int, "CE"/"PE") -> (token, tradingsymbol)
-    Only for NIFTY options.
-    """
     idx = {}
     for ins in instruments:
         if ins.get("segment") != "NFO-OPT":
@@ -338,7 +293,6 @@ def build_opt_index(instruments):
             strike = int(ins["strike"])
         except Exception:
             continue
-
         exp = ins["expiry"].date() if hasattr(ins["expiry"], "date") else ins["expiry"]
         opt_type = ins.get("instrument_type")
         if opt_type not in ("CE", "PE"):
@@ -351,12 +305,10 @@ def get_option_pair_for_strike_fast(strike, expiry, opt_index):
     pe = opt_index.get((expiry, int(strike), "PE"))
     if not ce or not pe:
         return None
-    ce_token, ce_symbol = ce
-    pe_token, pe_symbol = pe
-    return (ce_token, pe_token, ce_symbol, pe_symbol)
+    return (ce[0], pe[0], ce[1], pe[1])
 
 # ============================================================
-# STOCKO HELPERS (LIVE) + EXEC WRAPPER (LIVE/PAPER)
+# STOCKO HELPERS
 # ============================================================
 def _stocko_headers():
     return {
@@ -376,168 +328,135 @@ def stocko_search_token(keyword: str):
     raise ValueError(f"No NFO token found for {keyword}")
 
 def generate_numeric_order_id(offset=0):
-    base = int(time.time() * 1000)
-    return str(base + offset)[-15:]
+    return str(int(time.time() * 1000) + offset)[-15:]
 
-def stocko_place_order_token(token: int, side: str, qty: int,
-                             exchange="NFO", order_type="MARKET",
-                             product="NRML", validity="DAY",
-                             price=0, trigger_price=0, offset=0):
+def stocko_place_order_token(token: int, side: str, qty: int, offset=0):
     url = f"{STOCKO_BASE_URL}/api/v1/orders"
     order_id = generate_numeric_order_id(offset)
     payload = {
-        "exchange": exchange,
-        "order_type": order_type,
+        "exchange": "NFO",
+        "order_type": "MARKET",
         "instrument_token": int(token),
         "quantity": int(qty),
         "disclosed_quantity": 0,
         "order_side": side.upper(),
-        "price": price,
-        "trigger_price": trigger_price,
-        "validity": validity,
-        "product": product,
+        "price": 0,
+        "trigger_price": 0,
+        "validity": "DAY",
+        "product": "NRML",
         "client_id": STOCKO_CLIENT_ID,
         "user_order_id": order_id,
         "market_protection_percentage": 0,
         "device": "WEB"
     }
-
-    print(f"[{ts()}] 🆔 Placing {side.upper()} (token={token}) | user_order_id={order_id}")
+    print(f"[{ts()}] 🆔 Placing {side.upper()} token={token} order_id={order_id}")
     r = requests.post(url, json=payload, headers=_stocko_headers(), timeout=10)
     if r.status_code != 200:
         print(f"[{ts()}] ❌ Stocko {side.upper()} failed: {r.status_code} → {r.text}")
         return None
-
-    print(f"[{ts()}] ✅ Stocko {side.upper()} placed successfully (user_order_id={order_id})")
+    print(f"[{ts()}] ✅ Stocko {side.upper()} placed (order_id={order_id})")
     return r.json()
 
-def stocko_open_straddle(ce_keyword, pe_keyword):
-    ce_token = stocko_search_token(ce_keyword)
-    pe_token = stocko_search_token(pe_keyword)
-    print(f"[{ts()}] 💰 Opening straddle (CE={ce_keyword}, PE={pe_keyword})")
-    r1 = stocko_place_order_token(ce_token, "SELL", LOT_SIZE, offset=0)
-    r2 = stocko_place_order_token(pe_token, "SELL", LOT_SIZE, offset=1)
-    return (r1 is not None) and (r2 is not None)
-
-def stocko_close_straddle(ce_keyword, pe_keyword):
-    ce_token = stocko_search_token(ce_keyword)
-    pe_token = stocko_search_token(pe_keyword)
-    print(f"[{ts()}] 💰 Closing straddle (CE={ce_keyword}, PE={pe_keyword})")
-    r1 = stocko_place_order_token(ce_token, "BUY", LOT_SIZE, offset=2)
-    r2 = stocko_place_order_token(pe_token, "BUY", LOT_SIZE, offset=3)
-    return (r1 is not None) and (r2 is not None)
-
-def exec_open_straddle(ce_symbol, pe_symbol):
-    """LIVE -> place orders, PAPER -> simulate"""
+def _exec_single_leg(symbol: str, side: str, offset: int) -> str:
+    """Place or simulate a single-leg order."""
     if TRADE_MODE == "LIVE":
-        ok = stocko_open_straddle(ce_symbol, pe_symbol)
-        if not ok:
-            raise RuntimeError("Stocko open straddle failed (one or both legs)")
+        token = stocko_search_token(symbol)
+        result = stocko_place_order_token(token, side, LOT_SIZE, offset=offset)
+        if result is None:
+            raise RuntimeError(f"Stocko {side} failed for {symbol}")
         return "LIVE_ORDER_SENT"
     else:
-        print(f"[PAPER] Simulated SELL straddle: CE={ce_symbol}, PE={pe_symbol}, QTY={LOT_SIZE}")
-        return "PAPER_ORDER_SIMULATED"
-
-def exec_close_straddle(ce_symbol, pe_symbol):
-    """LIVE -> place orders, PAPER -> simulate"""
-    if TRADE_MODE == "LIVE":
-        ok = stocko_close_straddle(ce_symbol, pe_symbol)
-        if not ok:
-            raise RuntimeError("Stocko close straddle failed (one or both legs)")
-        return "LIVE_ORDER_SENT"
-    else:
-        print(f"[PAPER] Simulated BUY straddle:  CE={ce_symbol}, PE={pe_symbol}, QTY={LOT_SIZE}")
+        print(f"[PAPER] Simulated {side} leg: {symbol} QTY={LOT_SIZE}")
         return "PAPER_ORDER_SIMULATED"
 
 # ============================================================
-# LOGGING (DB)
+# LOGGING (Postgres)
 # ============================================================
-def log_trade(event, phase, expiry_tag, expiry_date, strike, action_price, vwap_at_action,
+def log_trade(event, phase, expiry_tag, expiry_date, strike,
+              action_price=None, vwap_at_action=None,
+              leg=None, leg_entry=None, leg_exit_price=None,
               pnl_realized=None, pnl_running=None, total_pnl=None,
               ce_ltp=None, pe_ltp=None, status="", note=""):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO nifty_vwap_trade (
-                    ts, event, phase, expiry_tag, expiry_date, strike,
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO nifty_vwap_trade (
+                        ts, event, phase, expiry_tag, expiry_date, strike,
+                        action_price, vwap_at_action,
+                        leg, leg_entry, leg_exit_price,
+                        pnl_realized, pnl_running, total_pnl,
+                        ce_ltp, pe_ltp, status, note
+                    ) VALUES (
+                        %s,%s,%s,%s,%s,%s,
+                        %s,%s,
+                        %s,%s,%s,
+                        %s,%s,%s,
+                        %s,%s,%s,%s
+                    )
+                """, (
+                    now_ist(), event, phase, expiry_tag, expiry_date, strike,
                     action_price, vwap_at_action,
+                    leg, leg_entry, leg_exit_price,
                     pnl_realized, pnl_running, total_pnl,
                     ce_ltp, pe_ltp, status, note
-                )
-                VALUES (%s,%s,%s,%s,%s,%s,
-                        %s,%s,%s,%s,%s,
-                        %s,%s,%s,%s)
-            """, (
-                now_ist(), event, phase, expiry_tag, expiry_date, strike,
-                action_price, vwap_at_action,
-                pnl_realized, pnl_running, total_pnl,
-                ce_ltp, pe_ltp, status, note
-            ))
-        conn.commit()
+                ))
+            conn.commit()
+    except Exception as e:
+        print(f"[LOG_TRADE_FAIL] {e}")
 
 def log_vwap(event, phase, spot,
              expiry_tag=None, expiry_date=None,
              strike=None, ltp=None, vwap=None, cum_pv=None, cum_vol=None,
              ce_vol=None, pe_vol=None, ce_ltp=None, pe_ltp=None, note=""):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO nifty_vwap_minute (
-                    ts, phase, event, spot,
-                    expiry_tag, expiry_date,
-                    strike, straddle_ltp, vwap,
-                    cum_pv, cum_vol,
-                    ce_vol, pe_vol,
-                    ce_ltp, pe_ltp,
-                    note
-                )
-                VALUES (%s,%s,%s,%s,
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO nifty_vwap_minute (
+                        ts, phase, event, spot,
+                        expiry_tag, expiry_date,
+                        strike, straddle_ltp, vwap,
+                        cum_pv, cum_vol,
+                        ce_vol, pe_vol,
+                        ce_ltp, pe_ltp, note
+                    ) VALUES (
+                        %s,%s,%s,%s,
                         %s,%s,
                         %s,%s,%s,
                         %s,%s,
                         %s,%s,
-                        %s,%s,
-                        %s)
-            """, (
-                now_ist(), phase, event, spot,
-                expiry_tag, expiry_date,
-                strike, ltp, vwap,
-                cum_pv, cum_vol,
-                ce_vol, pe_vol,
-                ce_ltp, pe_ltp,
-                note
-            ))
-        conn.commit()
+                        %s,%s,%s
+                    )
+                """, (
+                    now_ist(), phase, event, spot,
+                    expiry_tag, expiry_date,
+                    strike, ltp, vwap,
+                    cum_pv, cum_vol,
+                    ce_vol, pe_vol,
+                    ce_ltp, pe_ltp, note
+                ))
+            conn.commit()
+    except Exception as e:
+        print(f"[LOG_VWAP_FAIL] {e}")
 
-# ========================= PART 1 ENDS HERE =========================
-# Part 2 continues with:
-# - StraddleVWAP class
-# - main() with kill-switch check inside the trading loop
-# - entry point
 # ============================================================
-# VWAP OBJECT
+# PRELOCK VWAP OBJECT (unchanged — used only before ATM lock)
 # ============================================================
 class StraddleVWAP:
     def __init__(self, strike, expiry_date, expiry_tag, ce_token, pe_token, ce_symbol, pe_symbol):
-        self.strike = strike
+        self.strike      = strike
         self.expiry_date = expiry_date
-        self.expiry_tag = expiry_tag
-
-        self.ce_token = ce_token
-        self.pe_token = pe_token
-        self.ce_symbol = ce_symbol
-        self.pe_symbol = pe_symbol
+        self.expiry_tag  = expiry_tag
+        self.ce_token    = ce_token
+        self.pe_token    = pe_token
+        self.ce_symbol   = ce_symbol
+        self.pe_symbol   = pe_symbol
 
         self.last_ce_vol = None
         self.last_pe_vol = None
-        self.cum_pv = 0.0
+        self.cum_pv  = 0.0
         self.cum_vol = 0.0
-
-        self.in_pos = False
-        self.entry = None
-        self.realized = 0.0
-        self.disabled = False
-        self.entries_taken = 0
 
     def quote(self):
         q = safe_quote([self.ce_token, self.pe_token])
@@ -550,17 +469,16 @@ class StraddleVWAP:
         try:
             ce_ltp, pe_ltp, ce_v, pe_v = self.quote()
         except Exception as e:
-            print(f"[WARN] {self.expiry_tag} {self.strike} update skipped due to quote error: {e}")
+            print(f"[WARN] {self.expiry_tag} {self.strike} update skipped: {e}")
             return (None, None, self.cum_pv, self.cum_vol, None, None, None, None)
 
         straddle = ce_ltp + pe_ltp
-
         d_ce = 0 if self.last_ce_vol is None else max(0, ce_v - self.last_ce_vol)
         d_pe = 0 if self.last_pe_vol is None else max(0, pe_v - self.last_pe_vol)
-        vol = d_ce + d_pe
+        vol  = d_ce + d_pe
 
         if vol > 0:
-            self.cum_pv += straddle * vol
+            self.cum_pv  += straddle * vol
             self.cum_vol += vol
 
         self.last_ce_vol = ce_v
@@ -569,258 +487,524 @@ class StraddleVWAP:
         vwap = self.cum_pv / self.cum_vol if self.cum_vol > 0 else None
         return straddle, vwap, self.cum_pv, self.cum_vol, ce_v, pe_v, ce_ltp, pe_ltp
 
-    def status(self):
-        if self.disabled:
-            return "DISABLED"
-        return "IN" if self.in_pos else "OUT"
 
-    def pnl_run(self, ltp):
-        if not (self.in_pos and self.entry is not None and ltp is not None):
-            return 0.0
-        return (self.entry - ltp) * LOT_SIZE
+# ============================================================
+# ACTIVE STRADDLE MANAGER (post-lock — v2 logic)
+# ============================================================
+class ActiveStraddleManager:
+    """
+    Entry State Machine:
+        UNARMED  -> waiting for straddle to CLOSE ABOVE vwap
+        ARMED    -> saw close above vwap; waiting for CLOSE BELOW vwap
+        ENTERED  -> both legs sold; per-leg exit / re-entry active
 
-    def try_entry(self, ltp, vwap, phase):
-        if self.disabled or self.in_pos or vwap is None or ltp is None:
+    Leg management:
+        - Partial exit: straddle > vwap + EXIT_WINDOW_ABOVE
+          -> close ONLY the loss-making leg (higher LTP vs entry)
+          -> profit leg stays open
+        - Single remaining leg hard stop: total PnL <= MAX_LOSS_LIMIT -> close it
+        - Re-entry (one leg closed): straddle crosses below vwap -> re-add closed leg
+        - Re-entry (both legs closed, not hard-stopped): straddle crosses below vwap
+          -> re-enter both legs (crossover still required)
+    """
+
+    def __init__(self, strike, expiry_date, expiry_tag,
+                 ce_token, pe_token, ce_symbol, pe_symbol):
+        self.strike      = strike
+        self.expiry_date = expiry_date
+        self.expiry_tag  = expiry_tag
+        self.ce_token    = ce_token
+        self.pe_token    = pe_token
+        self.ce_symbol   = ce_symbol
+        self.pe_symbol   = pe_symbol
+
+        # VWAP (volume-weighted, seeded from prelock object after lock)
+        self.last_ce_vol = None
+        self.last_pe_vol = None
+        self.cum_pv  = 0.0
+        self.cum_vol = 0.0
+
+        # Entry state machine
+        self.entry_state = "UNARMED"   # UNARMED | ARMED | ENTERED
+
+        # Per-leg state
+        self.ce_open        = False
+        self.pe_open        = False
+        self.ce_entry_price = None   # CE LTP at time of sell
+        self.pe_entry_price = None   # PE LTP at time of sell
+        self.ce_realized    = 0.0
+        self.pe_realized    = 0.0
+
+        # Which leg is currently closed after a partial exit (for re-entry)
+        self.partial_closed_leg = None   # "CE" | "PE" | None
+
+        # Hard-stopped: no further action
+        self.hard_stopped = False
+
+        # For crossover detection (was previous candle close above vwap?)
+        self.prev_close_above = None
+
+        # Total entries taken (both legs count as 1 entry)
+        self.entries_taken = 0
+
+    # ---------------------------------------------------------------- quote
+    def quote(self):
+        q = safe_quote([self.ce_token, self.pe_token])
+        v = {d["instrument_token"]: d for d in q.values()}
+        ce = v[self.ce_token]
+        pe = v[self.pe_token]
+        return ce["last_price"], pe["last_price"], ce["volume"], pe["volume"]
+
+    # ---------------------------------------------------------------- vwap
+    def _update_vwap(self, straddle, ce_v, pe_v):
+        d_ce = 0 if self.last_ce_vol is None else max(0, ce_v - self.last_ce_vol)
+        d_pe = 0 if self.last_pe_vol is None else max(0, pe_v - self.last_pe_vol)
+        vol  = d_ce + d_pe
+
+        if vol > 0:
+            self.cum_pv  += straddle * vol
+            self.cum_vol += vol
+
+        self.last_ce_vol = ce_v
+        self.last_pe_vol = pe_v
+
+        return self.cum_pv / self.cum_vol if self.cum_vol > 0 else None
+
+    # ---------------------------------------------------------------- pnl helpers
+    def _pnl_leg(self, leg: str, ce_ltp: float, pe_ltp: float) -> float:
+        if leg == "CE":
+            if not self.ce_open or self.ce_entry_price is None:
+                return 0.0
+            return (self.ce_entry_price - ce_ltp) * LOT_SIZE
+        else:
+            if not self.pe_open or self.pe_entry_price is None:
+                return 0.0
+            return (self.pe_entry_price - pe_ltp) * LOT_SIZE
+
+    def pnl_running(self, ce_ltp, pe_ltp):
+        return self._pnl_leg("CE", ce_ltp, pe_ltp) + self._pnl_leg("PE", ce_ltp, pe_ltp)
+
+    def pnl_total(self, ce_ltp, pe_ltp):
+        return self.ce_realized + self.pe_realized + self.pnl_running(ce_ltp, pe_ltp)
+
+    def status_str(self):
+        ce = "OPEN" if self.ce_open else "CLOSED"
+        pe = "OPEN" if self.pe_open else "CLOSED"
+        return f"{self.entry_state} CE={ce} PE={pe}"
+
+    # ---------------------------------------------------------------- order helpers
+    def _open_leg(self, leg: str, ce_ltp: float, pe_ltp: float,
+                  vwap: float, phase: str, reason: str) -> bool:
+        symbol = self.ce_symbol if leg == "CE" else self.pe_symbol
+        offset = 0 if leg == "CE" else 1
+        try:
+            exec_note = _exec_single_leg(symbol, "SELL", offset)
+        except Exception as e:
+            print(f"[OPEN_LEG_FAIL] {leg} {symbol}: {e}")
+            log_trade("OPEN_LEG_FAIL", phase, self.expiry_tag, self.expiry_date, self.strike,
+                      action_price=ce_ltp + pe_ltp, vwap_at_action=vwap,
+                      leg=leg, ce_ltp=ce_ltp, pe_ltp=pe_ltp,
+                      status=self.status_str(), note=f"{reason} {e}")
             return False
-        if self.entries_taken >= MAX_ENTRIES_PER_STRIKE:
+
+        if leg == "CE":
+            self.ce_open        = True
+            self.ce_entry_price = ce_ltp
+        else:
+            self.pe_open        = True
+            self.pe_entry_price = pe_ltp
+
+        entry_px = ce_ltp if leg == "CE" else pe_ltp
+        log_trade("OPEN_LEG", phase, self.expiry_tag, self.expiry_date, self.strike,
+                  action_price=ce_ltp + pe_ltp, vwap_at_action=vwap,
+                  leg=leg, leg_entry=entry_px,
+                  ce_ltp=ce_ltp, pe_ltp=pe_ltp,
+                  status=self.status_str(), note=f"{reason} {exec_note}")
+        print(f"[OPEN_LEG {TRADE_MODE}] {ts()} leg={leg} symbol={symbol} "
+              f"ce={ce_ltp:.2f} pe={pe_ltp:.2f} reason={reason}")
+        return True
+
+    def _close_leg(self, leg: str, ce_ltp: float, pe_ltp: float,
+                   vwap: float, phase: str, reason: str) -> bool:
+        symbol   = self.ce_symbol if leg == "CE" else self.pe_symbol
+        exit_ltp = ce_ltp if leg == "CE" else pe_ltp
+        entry_px = self.ce_entry_price if leg == "CE" else self.pe_entry_price
+        offset   = 10 if leg == "CE" else 11
+        try:
+            exec_note = _exec_single_leg(symbol, "BUY", offset)
+        except Exception as e:
+            print(f"[CLOSE_LEG_FAIL] {leg} {symbol}: {e}")
+            log_trade("CLOSE_LEG_FAIL", phase, self.expiry_tag, self.expiry_date, self.strike,
+                      action_price=ce_ltp + pe_ltp, vwap_at_action=vwap,
+                      leg=leg, leg_entry=entry_px, leg_exit_price=exit_ltp,
+                      ce_ltp=ce_ltp, pe_ltp=pe_ltp,
+                      status=self.status_str(), note=f"{reason} {e}")
             return False
 
-        if not ((vwap - ENTRY_WINDOW_BELOW) <= ltp <= vwap):
-            return False
+        leg_pnl = (entry_px - exit_ltp) * LOT_SIZE if entry_px is not None else 0.0
 
+        if leg == "CE":
+            self.ce_realized += leg_pnl
+            self.ce_open      = False
+        else:
+            self.pe_realized += leg_pnl
+            self.pe_open      = False
+
+        total = self.pnl_total(ce_ltp, pe_ltp)
+        log_trade("CLOSE_LEG", phase, self.expiry_tag, self.expiry_date, self.strike,
+                  action_price=ce_ltp + pe_ltp, vwap_at_action=vwap,
+                  leg=leg, leg_entry=entry_px, leg_exit_price=exit_ltp,
+                  pnl_realized=leg_pnl, total_pnl=total,
+                  ce_ltp=ce_ltp, pe_ltp=pe_ltp,
+                  status=self.status_str(), note=f"{reason} {exec_note}")
+        print(f"[CLOSE_LEG {TRADE_MODE}] {ts()} leg={leg} pnl={leg_pnl:.2f} "
+              f"total={total:.2f} reason={reason}")
+        return True
+
+    def _close_all_open_legs(self, ce_ltp, pe_ltp, vwap, phase, reason):
+        if self.ce_open:
+            self._close_leg("CE", ce_ltp, pe_ltp, vwap, phase, reason)
+        if self.pe_open:
+            self._close_leg("PE", ce_ltp, pe_ltp, vwap, phase, reason)
+
+    # ---------------------------------------------------------------- main per-minute handler
+    def on_minute_close(self, phase: str, trade_allowed: bool = True):
+        """
+        Called once per minute candle close.
+        trade_allowed=False  -> VWAP still updates, exits/SL still fire,
+                                but NO new entries (initial or re-entry) are placed.
+        Returns (straddle_ltp, vwap, ce_ltp, pe_ltp) or (None, None, None, None) on error.
+        """
+        if self.hard_stopped:
+            return None, None, None, None
+
+        try:
+            ce_ltp, pe_ltp, ce_v, pe_v = self.quote()
+        except Exception as e:
+            print(f"[WARN] quote error in on_minute_close: {e}")
+            return None, None, None, None
+
+        straddle = ce_ltp + pe_ltp
+        vwap = self._update_vwap(straddle, ce_v, pe_v)
+
+        if vwap is None:
+            return straddle, None, ce_ltp, pe_ltp
+
+        above_vwap = straddle > vwap
+
+        # ========== UNARMED ==========
+        if self.entry_state == "UNARMED":
+            if above_vwap:
+                self.entry_state      = "ARMED"
+                self.prev_close_above = True
+                print(f"[ARMED] {ts()} straddle={straddle:.2f} vwap={vwap:.2f} — waiting for close below")
+                log_trade("ARMED", phase, self.expiry_tag, self.expiry_date, self.strike,
+                          action_price=straddle, vwap_at_action=vwap,
+                          ce_ltp=ce_ltp, pe_ltp=pe_ltp,
+                          status=self.status_str(), note="Straddle closed above vwap — armed")
+            else:
+                self.prev_close_above = False
+            return straddle, vwap, ce_ltp, pe_ltp
+
+        # ========== ARMED ==========
+        if self.entry_state == "ARMED":
+            if not above_vwap:
+                # Crossover: above -> below
+                if not trade_allowed:
+                    print(f"[ENTRY_BLOCKED] Kill-switch flag=FALSE — crossover detected but entry suppressed")
+                elif self.entries_taken >= MAX_ENTRIES_PER_STRIKE:
+                    print(f"[ENTRY_SKIP] max entries={MAX_ENTRIES_PER_STRIKE} reached")
+                else:
+                    ok_ce = self._open_leg("CE", ce_ltp, pe_ltp, vwap, phase, "INITIAL_ENTRY")
+                    ok_pe = self._open_leg("PE", ce_ltp, pe_ltp, vwap, phase, "INITIAL_ENTRY")
+                    if ok_ce and ok_pe:
+                        self.entry_state        = "ENTERED"
+                        self.partial_closed_leg = None
+                        self.entries_taken     += 1
+                        log_trade("ENTRY", phase, self.expiry_tag, self.expiry_date, self.strike,
+                                  action_price=straddle, vwap_at_action=vwap,
+                                  ce_ltp=ce_ltp, pe_ltp=pe_ltp,
+                                  total_pnl=self.pnl_total(ce_ltp, pe_ltp),
+                                  status=self.status_str(),
+                                  note=f"Both legs SELL entries={self.entries_taken} {TRADE_MODE}")
+                        print(f"[ENTRY {TRADE_MODE}] {ts()} strike={self.strike} "
+                              f"straddle={straddle:.2f} vwap={vwap:.2f} entries={self.entries_taken}")
+            self.prev_close_above = above_vwap
+            return straddle, vwap, ce_ltp, pe_ltp
+
+        # ========== ENTERED ==========
+        if self.entry_state == "ENTERED":
+            total = self.pnl_total(ce_ltp, pe_ltp)
+
+            # --- HARD STOP: total PnL breached (check first, before any other logic) ---
+            if total <= MAX_LOSS_LIMIT:
+                print(f"[HARD_SL] {ts()} total={total:.2f} <= limit={MAX_LOSS_LIMIT} — closing all")
+                self._close_all_open_legs(ce_ltp, pe_ltp, vwap, phase, "HARD_SL")
+                self.hard_stopped = True
+                log_trade("HARD_SL_DONE", phase, self.expiry_tag, self.expiry_date, self.strike,
+                          action_price=straddle, vwap_at_action=vwap,
+                          ce_ltp=ce_ltp, pe_ltp=pe_ltp,
+                          total_pnl=self.pnl_total(ce_ltp, pe_ltp),
+                          status=self.status_str(), note="Hard stop — all legs closed")
+                return straddle, vwap, ce_ltp, pe_ltp
+
+            # --- SOLO LEG SL: exactly one leg open (other was partially exited) ---
+            # The surviving leg is now naked. Monitor it independently.
+            # If its LTP rises more than SINGLE_LEG_SL above its own entry price,
+            # the market reversed and it is now losing — close it.
+            solo_leg = None
+            if self.ce_open and not self.pe_open:
+                solo_leg = "CE"
+            elif self.pe_open and not self.ce_open:
+                solo_leg = "PE"
+
+            if solo_leg is not None:
+                solo_entry = self.ce_entry_price if solo_leg == "CE" else self.pe_entry_price
+                solo_ltp   = ce_ltp             if solo_leg == "CE" else pe_ltp
+                if solo_entry is not None:
+                    # Positive value means LTP moved above entry → leg is losing
+                    leg_drawdown = solo_ltp - solo_entry
+                    if leg_drawdown > SINGLE_LEG_SL:
+                        print(f"[SOLO_LEG_SL] {ts()} {solo_leg} solo leg drawdown={leg_drawdown:.2f} "
+                              f"> SL={SINGLE_LEG_SL} (entry={solo_entry:.2f} ltp={solo_ltp:.2f}) — closing")
+                        ok = self._close_leg(solo_leg, ce_ltp, pe_ltp, vwap, phase, "SOLO_LEG_SL")
+                        if ok:
+                            log_trade("SOLO_LEG_SL", phase, self.expiry_tag, self.expiry_date, self.strike,
+                                      action_price=straddle, vwap_at_action=vwap,
+                                      leg=solo_leg,
+                                      leg_entry=solo_entry, leg_exit_price=solo_ltp,
+                                      ce_ltp=ce_ltp, pe_ltp=pe_ltp,
+                                      total_pnl=self.pnl_total(ce_ltp, pe_ltp),
+                                      status=self.status_str(),
+                                      note=f"Solo leg SL hit: drawdown={leg_drawdown:.2f} > {SINGLE_LEG_SL}")
+                        self.prev_close_above = above_vwap
+                        return straddle, vwap, ce_ltp, pe_ltp
+
+            # --- PARTIAL EXIT: straddle above vwap + buffer, BOTH legs open ---
+            if straddle > (vwap + EXIT_WINDOW_ABOVE) and self.ce_open and self.pe_open:
+                ce_loss = ce_ltp - (self.ce_entry_price or ce_ltp)
+                pe_loss = pe_ltp - (self.pe_entry_price or pe_ltp)
+                loss_leg = "CE" if ce_loss >= pe_loss else "PE"
+
+                print(f"[PARTIAL_EXIT] {ts()} straddle={straddle:.2f} vwap={vwap:.2f} "
+                      f"ce_loss={ce_loss:.2f} pe_loss={pe_loss:.2f} closing={loss_leg}")
+                ok = self._close_leg(loss_leg, ce_ltp, pe_ltp, vwap, phase, "PARTIAL_EXIT")
+                if ok:
+                    self.partial_closed_leg = loss_leg
+                    log_trade("PARTIAL_EXIT", phase, self.expiry_tag, self.expiry_date, self.strike,
+                              action_price=straddle, vwap_at_action=vwap,
+                              leg=loss_leg,
+                              ce_ltp=ce_ltp, pe_ltp=pe_ltp,
+                              total_pnl=self.pnl_total(ce_ltp, pe_ltp),
+                              status=self.status_str(),
+                              note=f"Closed loss leg={loss_leg}, profit leg stays open")
+
+            # --- RE-ENTRY LOGIC ---
+            elif (not above_vwap) and self.prev_close_above:
+
+                # Case A: one leg was partially closed — re-add it
+                if self.partial_closed_leg is not None:
+                    reopen_leg = self.partial_closed_leg
+                    if not trade_allowed:
+                        print(f"[RE_ENTRY_BLOCKED] Kill-switch flag=FALSE — crossover detected but {reopen_leg} re-entry suppressed")
+                    elif self.entries_taken < MAX_ENTRIES_PER_STRIKE:
+                        print(f"[RE_ENTRY_ONE_LEG] {ts()} re-adding {reopen_leg} "
+                              f"straddle={straddle:.2f} crossed below vwap={vwap:.2f}")
+                        ok = self._open_leg(reopen_leg, ce_ltp, pe_ltp, vwap, phase, "RE_ENTRY")
+                        if ok:
+                            self.partial_closed_leg = None
+                            self.entries_taken += 1
+                            log_trade("RE_ENTRY", phase, self.expiry_tag, self.expiry_date, self.strike,
+                                      action_price=straddle, vwap_at_action=vwap,
+                                      leg=reopen_leg,
+                                      ce_ltp=ce_ltp, pe_ltp=pe_ltp,
+                                      total_pnl=self.pnl_total(ce_ltp, pe_ltp),
+                                      status=self.status_str(),
+                                      note=f"Re-entered {reopen_leg} entries={self.entries_taken} {TRADE_MODE}")
+                    else:
+                        print(f"[RE_ENTRY_SKIP] max entries={MAX_ENTRIES_PER_STRIKE} reached")
+
+                # Case B: both legs closed (not hard-stopped) — re-enter both
+                elif not self.ce_open and not self.pe_open and not self.hard_stopped:
+                    if not trade_allowed:
+                        print(f"[RE_ENTRY_BOTH_BLOCKED] Kill-switch flag=FALSE — crossover detected but both-leg re-entry suppressed")
+                    elif self.entries_taken < MAX_ENTRIES_PER_STRIKE:
+                        print(f"[RE_ENTRY_BOTH] {ts()} both legs closed, "
+                              f"straddle crossed below vwap={vwap:.2f} — re-entering both")
+                        ok_ce = self._open_leg("CE", ce_ltp, pe_ltp, vwap, phase, "RE_ENTRY_BOTH")
+                        ok_pe = self._open_leg("PE", ce_ltp, pe_ltp, vwap, phase, "RE_ENTRY_BOTH")
+                        if ok_ce and ok_pe:
+                            self.partial_closed_leg = None
+                            self.entries_taken += 1
+                            log_trade("RE_ENTRY_BOTH", phase, self.expiry_tag, self.expiry_date, self.strike,
+                                      action_price=straddle, vwap_at_action=vwap,
+                                      ce_ltp=ce_ltp, pe_ltp=pe_ltp,
+                                      total_pnl=self.pnl_total(ce_ltp, pe_ltp),
+                                      status=self.status_str(),
+                                      note=f"Both legs re-entered entries={self.entries_taken} {TRADE_MODE}")
+                    else:
+                        print(f"[RE_ENTRY_BOTH_SKIP] max entries={MAX_ENTRIES_PER_STRIKE} reached")
+
+            self.prev_close_above = above_vwap
+            return straddle, vwap, ce_ltp, pe_ltp
+
+        return straddle, vwap, ce_ltp, pe_ltp
+
+    # ---------------------------------------------------------------- EOD / kill-switch close
+    def close_all_now(self, phase: str, reason: str = "EOD_CLOSE"):
+        """Force-close all open legs immediately."""
+        if self.hard_stopped:
+            return
         try:
             ce_ltp, pe_ltp, _, _ = self.quote()
-        except Exception as e:
-            print(f"[ENTRY_SKIP_QUOTE_ERR] {self.expiry_tag} {self.strike} error={e}")
-            return False
+        except Exception:
+            ce_ltp = pe_ltp = 0.0
 
-        try:
-            exec_note = exec_open_straddle(self.ce_symbol, self.pe_symbol)
+        vwap = self.cum_pv / self.cum_vol if self.cum_vol > 0 else None
+        self._close_all_open_legs(ce_ltp, pe_ltp, vwap, phase, reason)
+        total = self.pnl_total(ce_ltp, pe_ltp)
+        print(f"[{reason}] {ts()} ce_realized={self.ce_realized:.2f} "
+              f"pe_realized={self.pe_realized:.2f} total={total:.2f}")
 
-            self.in_pos = True
-            self.entry = ltp
-            self.entries_taken += 1
-
-            note = (f"{self.expiry_tag} ENTRY {TRADE_MODE} ce={ce_ltp:.2f} pe={pe_ltp:.2f} "
-                    f"entries={self.entries_taken} {exec_note}")
-            log_trade("ENTRY", phase, self.expiry_tag, self.expiry_date, self.strike, ltp, vwap,
-                      ce_ltp=ce_ltp, pe_ltp=pe_ltp,
-                      status=self.status(), note=note)
-            print(f"[ENTRY {TRADE_MODE}] {ts()} {self.expiry_tag} strike={self.strike} ltp={ltp:.2f} vwap={vwap:.2f} entries={self.entries_taken}")
-            return True
-
-        except Exception as e:
-            note = f"{self.expiry_tag} ENTRY_FAIL {TRADE_MODE} {type(e).__name__}: {e}"
-            log_trade("ENTRY_FAIL", phase, self.expiry_tag, self.expiry_date, self.strike, ltp, vwap,
-                      ce_ltp=ce_ltp, pe_ltp=pe_ltp,
-                      status=self.status(), note=note)
-            print(f"[ENTRY_FAIL] {ts()} {self.expiry_tag} strike={self.strike} error={e}")
-            return False
-
-    def try_exit(self, ltp, vwap, phase):
-        if not self.in_pos or ltp is None or vwap is None:
-            return False
-
-        try:
-            ce_ltp, pe_ltp, *_ = self.quote()
-        except Exception as e:
-            print(f"[EXIT_SKIP_QUOTE_ERR] {self.expiry_tag} {self.strike} error={e}")
-            return False
-
-        pnl = self.pnl_run(ltp)
-        total = self.realized + pnl
-
-        if total <= MAX_LOSS_LIMIT:
-            try:
-                exec_note = exec_close_straddle(self.ce_symbol, self.pe_symbol)
-
-                self.realized = total
-                self.in_pos = False
-                self.disabled = True
-
-                note = (f"{self.expiry_tag} HARD_SL {TRADE_MODE} ce={ce_ltp:.2f} pe={pe_ltp:.2f} "
-                        f"entries={self.entries_taken} {exec_note}")
-                log_trade("HARD_SL", phase, self.expiry_tag, self.expiry_date, self.strike, ltp, vwap,
-                          pnl_realized=pnl, total_pnl=self.realized,
-                          ce_ltp=ce_ltp, pe_ltp=pe_ltp,
-                          status=self.status(), note=note)
-                print(f"[HARD_SL {TRADE_MODE}] {ts()} {self.expiry_tag} strike={self.strike} total={self.realized:.2f}")
-                return True
-            except Exception as e:
-                note = f"{self.expiry_tag} HARD_SL_FAIL {TRADE_MODE} {type(e).__name__}: {e}"
-                log_trade("HARD_SL_FAIL", phase, self.expiry_tag, self.expiry_date, self.strike, ltp, vwap,
-                          pnl_realized=pnl, total_pnl=total,
-                          ce_ltp=ce_ltp, pe_ltp=pe_ltp,
-                          status=self.status(), note=note)
-                print(f"[HARD_SL_FAIL] {ts()} {self.expiry_tag} strike={self.strike} error={e}")
-                return False
-
-        if ltp > (vwap + EXIT_WINDOW_ABOVE):
-            try:
-                exec_note = exec_close_straddle(self.ce_symbol, self.pe_symbol)
-
-                self.realized = total
-                self.in_pos = False
-                if self.entries_taken >= MAX_ENTRIES_PER_STRIKE:
-                    self.disabled = True
-
-                note = (f"{self.expiry_tag} EXIT {TRADE_MODE} ce={ce_ltp:.2f} pe={pe_ltp:.2f} "
-                        f"entries={self.entries_taken} {exec_note}")
-                log_trade("EXIT", phase, self.expiry_tag, self.expiry_date, self.strike, ltp, vwap,
-                          pnl_realized=pnl, total_pnl=self.realized,
-                          ce_ltp=ce_ltp, pe_ltp=pe_ltp,
-                          status=self.status(), note=note)
-                print(f"[EXIT {TRADE_MODE}] {ts()} {self.expiry_tag} strike={self.strike} total={self.realized:.2f} entries={self.entries_taken}")
-                return True
-            except Exception as e:
-                note = f"{self.expiry_tag} EXIT_FAIL {TRADE_MODE} {type(e).__name__}: {e}"
-                log_trade("EXIT_FAIL", phase, self.expiry_tag, self.expiry_date, self.strike, ltp, vwap,
-                          pnl_realized=pnl, total_pnl=total,
-                          ce_ltp=ce_ltp, pe_ltp=pe_ltp,
-                          status=self.status(), note=note)
-                print(f"[EXIT_FAIL] {ts()} {self.expiry_tag} strike={self.strike} error={e}")
-                return False
-
-        return False
 
 # ============================================================
 # MAIN
 # ============================================================
 def main():
-    print("[INIT] Starting VWAP (PRELOCK ATM±N both expiries, then freeze & keep one) …")
+    print("[INIT] Starting VWAP Straddle v2 (Railway) — crossover entry + per-leg exit …")
 
-    # Wait until VWAP collection start
     while now_ist().time() < VWAP_START:
         time.sleep(0.5)
 
     instruments = load_instruments_nfo()
-    opt_index = build_opt_index(instruments)
+    opt_index   = build_opt_index(instruments)
+    today       = now_ist().date()
 
-    today = now_ist().date()
-
-    # =========================================================
-    # ✅ FIX: EXPIRY MUST COME FROM INSTRUMENT DUMP (HOLIDAY SAFE)
-    # =========================================================
     curr_weekly, next_weekly = pick_curr_next_weekly_from_instruments(instruments, today)
+    print(f"[EXPIRY] Current weekly={curr_weekly}  Next weekly={next_weekly}")
 
-    print(f"[EXPIRY] Current weekly = {curr_weekly}")
-    print(f"[EXPIRY] Next weekly    = {next_weekly}")
-
-    # --------------------------
-    # Prelock base ATM is fixed at VWAP_START time (NO rolling)
-    # --------------------------
     try:
         spot_start = get_spot_ltp()
     except Exception as e:
-        raise RuntimeError(f"Could not read spot at VWAP start {VWAP_START}: {e}")
+        raise RuntimeError(f"Could not read spot at VWAP start: {e}")
 
     base_atm = nearest_50(spot_start)
-    strikes = [base_atm + i * STRIKE_STEP for i in range(-PRELOCK_WING_STRIKES, PRELOCK_WING_STRIKES + 1)]
+    strikes  = [base_atm + i * STRIKE_STEP
+                for i in range(-PRELOCK_WING_STRIKES, PRELOCK_WING_STRIKES + 1)]
     prelock_strikes = set(strikes)
 
-    print(f"[PRELOCK] Base ATM @ VWAP_START={VWAP_START} is {base_atm}")
-    print(f"[PRELOCK] Tracking strikes range {min(strikes)} to {max(strikes)} (±{PRELOCK_WING_STRIKES})")
+    print(f"[PRELOCK] Base ATM={base_atm}  range {min(strikes)}..{max(strikes)}")
 
-    # Build VWAP objects for both expiries, all strikes
-    prelock_objs = {
-        "CURR_WEEK": {},
-        "NEXT_WEEK": {}
-    }
-
+    prelock_objs = {"CURR_WEEK": {}, "NEXT_WEEK": {}}
     for s in strikes:
         meta_c = get_option_pair_for_strike_fast(s, curr_weekly, opt_index)
         meta_n = get_option_pair_for_strike_fast(s, next_weekly, opt_index)
-
         if not meta_c:
-            raise RuntimeError(f"No CE/PE found for CURRENT weekly {curr_weekly} strike={s}")
+            raise RuntimeError(f"No CE/PE for CURR weekly {curr_weekly} strike={s}")
         if not meta_n:
-            raise RuntimeError(f"No CE/PE found for NEXT weekly {next_weekly} strike={s}")
-
+            raise RuntimeError(f"No CE/PE for NEXT weekly {next_weekly} strike={s}")
         prelock_objs["CURR_WEEK"][s] = StraddleVWAP(s, curr_weekly, "CURR_WEEK", *meta_c)
         prelock_objs["NEXT_WEEK"][s] = StraddleVWAP(s, next_weekly, "NEXT_WEEK", *meta_n)
 
-    did_lock = False
-    phase = "prelock"
-
-    active = None
-    active_tag = None
+    did_lock      = False
+    phase         = "prelock"
+    active        = None        # ActiveStraddleManager (post-lock)
+    active_tag    = None
     active_expiry = None
-    atm_locked = None
+    atm_locked    = None
+    last_min      = None       # tracks which minute we last processed
 
-    last_min = None
+    # Kill-switch state — tracked across loop iterations so we don't
+    # repeatedly attempt to close already-closed positions.
+    kill_positions_closed = False   # True once we've successfully closed all legs due to flag=False
 
+    # How many seconds past the minute boundary to wait before sampling.
+    # This ensures we read the settled candle-close LTP, not a spike
+    # that happened right at the boundary and already reversed.
+    CANDLE_CLOSE_DELAY_SECS = int(os.getenv("CANDLE_CLOSE_DELAY_SECS", "5"))
+
+    # ============================================================
+    # MAIN LOOP
+    # ============================================================
     while now_ist().time() < EXIT_CUTOFF:
-        now = now_ist()
+        now      = now_ist()
         curr_min = now.minute
+        curr_sec = now.second
 
-        # --------------------------
-        # KILL SWITCH CHECK (NEW)
-        # --------------------------
-        if not is_kill_switch_on():
-            print("[KILL SWITCH] live_nifty_vwap=FALSE -> forcing exit & stopping.")
+        # ---- KILL SWITCH ----
+        # Check DB flag every tick (cheap read).
+        # Behaviour:
+        #   flag=False + open positions  -> close all open legs immediately (retry until done)
+        #   flag=False + no open positions -> block all new entries, keep looping + logging
+        #   flag=True  -> normal operation; if it was previously False, entries can resume
+        trade_allowed = is_kill_switch_on()
 
-            # If we have an open position, force square-off
-            if active is not None and getattr(active, "in_pos", False):
-                try:
-                    exec_note = exec_close_straddle(active.ce_symbol, active.pe_symbol)
-                    # best effort logging
+        if not trade_allowed:
+            # --- Close any open positions (only attempt if not already done) ---
+            if active is not None and not kill_positions_closed:
+                any_open = active.ce_open or active.pe_open
+                if any_open:
+                    print(f"[KILL SWITCH] flag=FALSE — closing all open legs …")
                     try:
-                        ce_ltp, pe_ltp, *_ = active.quote()
-                    except Exception:
-                        ce_ltp, pe_ltp = None, None
+                        active.close_all_now(phase, reason="FLAG_EXIT")
+                        # Check if all legs are actually closed now
+                        if not active.ce_open and not active.pe_open:
+                            kill_positions_closed = True
+                            print("[KILL SWITCH] All positions closed successfully.")
+                            log_trade("FLAG_EXIT", phase, active_tag or "NA", active_expiry, atm_locked,
+                                      status="FORCED_EXIT",
+                                      note="All legs closed — kill-switch flag=FALSE")
+                        else:
+                            # Partial failure — will retry next tick
+                            print("[KILL SWITCH] Some legs still open after close attempt — will retry.")
+                            log_trade("FLAG_EXIT_PARTIAL", phase, active_tag or "NA", active_expiry, atm_locked,
+                                      status="FORCED_EXIT_PARTIAL",
+                                      note="Close attempted but some legs still open — retrying next tick")
+                    except Exception as e:
+                        print(f"[KILL SWITCH] Close attempt failed: {e} — will retry next tick")
+                        log_trade("FLAG_EXIT_FAIL", phase, active_tag or "NA", active_expiry, atm_locked,
+                                  status="FORCED_EXIT_FAIL",
+                                  note=f"Kill-switch close failed: {e} — retrying")
+                else:
+                    # No open positions — just mark as done
+                    kill_positions_closed = True
+                    print("[KILL SWITCH] flag=FALSE — no open positions. Entries blocked.")
+                    log_trade("FLAG_BLOCK", phase, active_tag or "NA", active_expiry, atm_locked,
+                              status="ENTRY_BLOCKED",
+                              note="Kill-switch flag=FALSE — no positions to close, entries blocked")
 
-                    log_trade(
-                        "FLAG_EXIT", phase,
-                        active_tag or "NA",
-                        active_expiry,
-                        atm_locked,
-                        None, None,
-                        total_pnl=active.realized,
-                        ce_ltp=ce_ltp, pe_ltp=pe_ltp,
-                        status="FORCED_EXIT",
-                        note=f"Exited due to trade_flag.live_nifty_vwap=FALSE | {exec_note}"
-                    )
-                except Exception as e:
-                    print(f"[FLAG_EXIT_FAIL] {e}")
-                    log_trade(
-                        "FLAG_EXIT_FAIL", phase,
-                        active_tag or "NA",
-                        active_expiry,
-                        atm_locked,
-                        None, None,
-                        status="FORCED_EXIT_FAIL",
-                        note=f"Kill-switch exit failed: {type(e).__name__}: {e}"
-                    )
-            else:
-                # No position open; just log and stop
-                log_trade(
-                    "FLAG_STOP", phase,
-                    active_tag or "NA",
-                    active_expiry,
-                    atm_locked,
-                    None, None,
-                    status="STOPPED",
-                    note="Stopped due to trade_flag.live_nifty_vwap=FALSE (no open position)"
-                )
+            elif active is None and not kill_positions_closed:
+                kill_positions_closed = True
+                print("[KILL SWITCH] flag=FALSE in pre-lock phase — entries blocked.")
+                log_trade("FLAG_BLOCK", phase, "NA", None, None,
+                          status="ENTRY_BLOCKED",
+                          note="Kill-switch flag=FALSE in pre-lock — entries blocked")
 
-            sys.exit(0)
-
-        # Spot
-        try:
-            spot = get_spot_ltp()
-        except Exception as e:
-            print(f"[WARN] Spot quote failed, skipping tick: {e}")
+            # --- Skip all trading logic this tick ---
             time.sleep(1)
             continue
 
-        # --------------------------
-        # PRELOCK: update VWAP universe once per minute
-        # --------------------------
-        if not did_lock:
-            if last_min != curr_min:
-                last_min = curr_min
+        # flag is True here — reset closure tracker so re-entry can happen
+        # if flag was temporarily toggled and positions were closed
+        if trade_allowed and kill_positions_closed:
+            print("[KILL SWITCH] flag restored to TRUE — entries re-enabled.")
+            log_trade("FLAG_RESTORED", phase, active_tag or "NA", active_expiry, atm_locked,
+                      status="ENTRY_ENABLED",
+                      note="Kill-switch flag=TRUE restored — normal operation resumed")
+            kill_positions_closed = False
 
-                # Update ALL prelock objects (both expiries, all strikes) once per minute
+        # ---- SPOT ----
+        try:
+            spot = get_spot_ltp()
+        except Exception as e:
+            print(f"[WARN] Spot quote failed: {e}")
+            time.sleep(1)
+            continue
+
+        # ---- PRELOCK: update once per minute, after candle close delay ----
+        if not did_lock:
+            if last_min != curr_min and curr_sec >= CANDLE_CLOSE_DELAY_SECS:
+                last_min = curr_min
                 for tag in ("CURR_WEEK", "NEXT_WEEK"):
                     for s, obj in prelock_objs[tag].items():
                         ltp, vwap, cum_pv, cum_vol, ce_v, pe_v, ce_ltp, pe_ltp = obj.update()
@@ -831,94 +1015,90 @@ def main():
                                  ce_vol=ce_v, pe_vol=pe_v,
                                  ce_ltp=ce_ltp, pe_ltp=pe_ltp,
                                  note="prelock tracking")
-            # Check if freeze time reached
+
             if now.time() < ATM_LOCK_TIME:
                 time.sleep(1)
                 continue
 
-        # --------------------------
-        # LOCK ATM @ ATM_FREEZE_TIME (first time only)
-        # --------------------------
+        # ---- ATM LOCK (first time only) ----
         if (not did_lock) and now.time() >= ATM_LOCK_TIME:
             atm_locked = nearest_50(spot)
 
-            # HARD STOP if outside prelock range
             if atm_locked not in prelock_strikes:
-                msg = (f"[FATAL] ATM at freeze time ({ATM_LOCK_TIME}) is {atm_locked}, "
-                       f"outside prelock range [{min(prelock_strikes)}..{max(prelock_strikes)}] "
-                       f"(base_atm={base_atm}, wing=±{PRELOCK_WING_STRIKES}). Stopping.")
+                msg = (f"[FATAL] ATM at freeze={atm_locked} outside prelock range "
+                       f"[{min(prelock_strikes)}..{max(prelock_strikes)}]. Stopping.")
                 print(msg)
-                log_trade("OUT_OF_RANGE_EXIT", "locked", "NA", today, atm_locked, None, None, note=msg)
+                log_trade("OUT_OF_RANGE_EXIT", "locked", "NA", today, atm_locked, note=msg)
                 sys.exit(0)
 
-            # Read CURRENT-week premium at locked ATM using the already-tracked object
             obj_curr_lock = prelock_objs["CURR_WEEK"][atm_locked]
             ltp_curr, vwap_curr, *_ = obj_curr_lock.update()
-
             if ltp_curr is None:
-                raise RuntimeError("Could not read CURRENT-week straddle premium at lock time")
+                raise RuntimeError("Could not read CURR-week straddle premium at lock time")
 
-            if ltp_curr > PREMIUM_SWITCH_TH:
-                active_tag = "CURR_WEEK"
-                active_expiry = curr_weekly
-            else:
-                active_tag = "NEXT_WEEK"
-                active_expiry = next_weekly
+            active_tag    = "CURR_WEEK" if ltp_curr > PREMIUM_SWITCH_TH else "NEXT_WEEK"
+            active_expiry = curr_weekly  if active_tag == "CURR_WEEK"   else next_weekly
 
-            active = prelock_objs[active_tag][atm_locked]
+            chosen_prelock = prelock_objs[active_tag][atm_locked]
 
-            # After lock: discard everything else (stop calculating VWAP for other strikes/expiry)
-            prelock_objs = None
+            active = ActiveStraddleManager(
+                strike=atm_locked, expiry_date=active_expiry, expiry_tag=active_tag,
+                ce_token=chosen_prelock.ce_token, pe_token=chosen_prelock.pe_token,
+                ce_symbol=chosen_prelock.ce_symbol, pe_symbol=chosen_prelock.pe_symbol
+            )
+            # Seed VWAP state from prelock so continuity is preserved
+            active.cum_pv      = chosen_prelock.cum_pv
+            active.cum_vol     = chosen_prelock.cum_vol
+            active.last_ce_vol = chosen_prelock.last_ce_vol
+            active.last_pe_vol = chosen_prelock.last_pe_vol
+
+            prelock_objs = None   # free memory
 
             did_lock = True
-            phase = "locked"
-            last_min = None  # reset minute gate so first locked-minute runs cleanly
+            phase    = "locked"
+            last_min = None
 
             note = (f"ATM_LOCK={atm_locked} curr_prem={ltp_curr:.2f} th={PREMIUM_SWITCH_TH:.2f} "
                     f"-> TRADE={active_tag} expiry={active_expiry} MODE={TRADE_MODE}")
-            log_trade("ATM_LOCK", phase, active_tag, active_expiry, atm_locked, ltp_curr, vwap_curr, note=note)
+            log_trade("ATM_LOCK", phase, active_tag, active_expiry, atm_locked,
+                      action_price=ltp_curr, vwap_at_action=vwap_curr, note=note)
             print(f"[LOCK] {ts()} {note}")
 
-        # --------------------------
-        # POST-LOCK: only maintain chosen expiry + chosen strike
-        # --------------------------
-        ltp_a, vwap_a, cum_pv, cum_vol, ce_v, pe_v, ce_ltp, pe_ltp = active.update()
-
-        # Entry/Exit once per minute (as in your original)
-        if last_min != curr_min:
+        # ---- POST-LOCK: process once per minute, after candle close delay ----
+        if did_lock and (last_min != curr_min) and curr_sec >= CANDLE_CLOSE_DELAY_SECS:
             last_min = curr_min
 
-            entered = active.try_entry(ltp_a, vwap_a, phase)
-            if not entered:
-                active.try_exit(ltp_a, vwap_a, phase)
+            straddle, vwap, ce_ltp, pe_ltp = active.on_minute_close(phase, trade_allowed=trade_allowed)
 
-            # Heartbeat / VWAP row for active only
-            pnl_run = active.pnl_run(ltp_a) if active.in_pos else 0.0
-            total = active.realized + pnl_run
-            status = active.status()
+            if straddle is not None and vwap is not None:
+                run_pnl   = active.pnl_running(ce_ltp, pe_ltp)
+                total_pnl = active.pnl_total(ce_ltp, pe_ltp)
 
-            log_vwap("VWAP_ROW", phase, spot,
-                     expiry_tag=active_tag, expiry_date=active_expiry,
-                     strike=atm_locked, ltp=ltp_a, vwap=vwap_a,
-                     cum_pv=cum_pv, cum_vol=cum_vol,
-                     ce_vol=ce_v, pe_vol=pe_v,
-                     ce_ltp=ce_ltp, pe_ltp=pe_ltp,
-                     note=f"ACTIVE only | MODE={TRADE_MODE}")
+                log_vwap("VWAP_ROW", phase, spot,
+                         expiry_tag=active_tag, expiry_date=active_expiry,
+                         strike=atm_locked, ltp=straddle, vwap=vwap,
+                         cum_pv=active.cum_pv, cum_vol=active.cum_vol,
+                         ce_ltp=ce_ltp, pe_ltp=pe_ltp,
+                         note=f"state={active.entry_state} {active.status_str()} MODE={TRADE_MODE}")
 
-            log_trade("HEARTBEAT", phase, active_tag, active_expiry, atm_locked, ltp_a, vwap_a,
-                      pnl_realized=active.realized,
-                      pnl_running=pnl_run,
-                      total_pnl=total,
-                      ce_ltp=ce_ltp, pe_ltp=pe_ltp,
-                      status=status,
-                      note=f"{active_tag} heartbeat entries={active.entries_taken} MODE={TRADE_MODE}")
+                log_trade("HEARTBEAT", phase, active_tag, active_expiry, atm_locked,
+                          action_price=straddle, vwap_at_action=vwap,
+                          pnl_running=run_pnl,
+                          total_pnl=total_pnl,
+                          ce_ltp=ce_ltp, pe_ltp=pe_ltp,
+                          status=active.status_str(),
+                          note=f"entries={active.entries_taken} MODE={TRADE_MODE}")
 
         time.sleep(1)
 
-    print("[DONE] Trading day complete. Check DB logs.")
+    # ---- EOD: close any remaining open legs ----
+    if active is not None:
+        print("[EOD] Closing all open legs …")
+        active.close_all_now(phase, reason="EOD_CLOSE")
 
-# ============================================================
-# ENTRY POINT
+    print("[DONE] Trading day complete.")
+
+
 # ============================================================
 if __name__ == "__main__":
     main()
