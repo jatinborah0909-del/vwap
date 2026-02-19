@@ -55,11 +55,11 @@ if TRADE_MODE not in ("PAPER", "LIVE"):
 print(f"[MODE] Running in {TRADE_MODE} mode")
 
 # --- Kite config (data) ---
-# API_KEY = os.getenv("KITE_API_KEY", "").strip()
-# ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN", "").strip()
+API_KEY = os.getenv("KITE_API_KEY", "").strip()
+ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN", "").strip()
 
-API_KEY = "9qfecm39l1j64xyc"
-ACCESS_TOKEN = "w0oFr0nxovmuAmJU0Fv4gG0IHeND661k"
+#API_KEY = "9qfecm39l1j64xyc"
+#ACCESS_TOKEN = "w0oFr0nxovmuAmJU0Fv4gG0IHeND661k"
 
 if not API_KEY or not ACCESS_TOKEN:
     raise RuntimeError("Missing KITE_API_KEY or KITE_ACCESS_TOKEN")
