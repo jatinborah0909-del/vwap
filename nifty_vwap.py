@@ -5,38 +5,44 @@
 VWAP Straddle Strategy — Kite (data) + Stocko (orders) + Railway Postgres
 ==========================================================================
 
-v2 CHANGES
-----------
-✅ Crossover-based entry:
-   - Straddle must CLOSE ABOVE vwap first  (arms the trigger)
-   - Then CLOSE BELOW vwap                 (entry fires — both legs SELL)
-   - Simple "below vwap" alone is NOT enough
+v4 CHANGES (on top of v3)
+--------------------------
+✅ Open Interest (OI) change tracking:
+   - At VWAP_START: take a baseline OI snapshot for ±PRELOCK_WING_STRIKES strikes
+     of the CURRENT weekly expiry (CE + PE separately).
+   - Every minute: compute cumulative OI change vs the baseline snapshot and store
+     in two new DB columns:  ce_oi_change  and  pe_oi_change.
+   - Pre-lock: tracked for ALL strikes in the prelock range.
+   - Post-lock (after ATM_FREEZE_TIME): tracked ONLY for the locked ATM strike.
+   - Columns are added to nifty_vwap_minute via ALTER TABLE … ADD COLUMN IF NOT EXISTS
+     so no manual schema migration is needed.
 
-✅ Per-leg exit management:
-   - Exit signal (straddle > vwap + EXIT_WINDOW_ABOVE): close ONLY the loss-making leg
-   - Profit leg stays open and continues running
-   - If remaining single leg causes total PnL <= MAX_LOSS_LIMIT -> hard stop that leg too
+v3 CHANGES (on top of v2)
+--------------------------
+✅ Profit target + trailing stop (per-lot basis):
+   - PROFIT_PER_LOT  : profit (₹) per lot at which trailing activates
+   - TRAIL_PROFIT    : step size (₹) per lot for the trailing stop
 
-✅ Re-entry logic:
-   - One leg closed (partial exit): straddle crosses below vwap -> re-add the closed leg
-   - Both legs closed (not hard-stopped): straddle crosses below vwap -> re-enter both legs
-   - Re-entry still requires the above->below crossover; bare "below vwap" alone won't trigger
-
-✅ Railway / Postgres logging (unchanged)
-✅ Kill switch: trade_flag.live_nifty_vwap — now handles per-leg open positions
-✅ EOD force-close of any open legs
+v2 CHANGES (unchanged)
+-----------------------
+✅ Crossover-based entry
+✅ Per-leg exit management (partial exit of loss leg)
+✅ Re-entry logic
+✅ Railway / Postgres logging
+✅ Kill switch: trade_flag.live_nifty_vwap
+✅ EOD force-close
 
 PRELOCK (unchanged)
 -------------------
 ✅ Track CURRENT week + NEXT week expiry VWAP from VWAP_START
 ✅ ATM fixed at VWAP_START spot price; track ±PRELOCK_WING_STRIKES strikes
-✅ At ATM_FREEZE_TIME: decide expiry (curr prem > PREMIUM_SWITCH_TH -> curr, else next)
+✅ At ATM_FREEZE_TIME: decide expiry (curr prem > PREMIUM_SWITCH_TH → curr, else next)
 ✅ Hard stop if frozen ATM outside prelock range
 
 LIVE vs PAPER
 -------------
-- TRADE_MODE=PAPER  -> NO real orders (only logs)
-- TRADE_MODE=LIVE   -> Orders via Stocko API
+- TRADE_MODE=PAPER  → NO real orders (only logs)
+- TRADE_MODE=LIVE   → Orders via Stocko API
 """
 
 import os
@@ -80,11 +86,22 @@ MAX_LOSS_LIMIT         = float(os.getenv("MAX_LOSS_LIMIT",         "-1700.0"))
 MAX_ENTRIES_PER_STRIKE = int(os.getenv("MAX_ENTRIES_PER_STRIKE",   "4"))
 PREMIUM_SWITCH_TH      = float(os.getenv("PREMIUM_SWITCH_TH",      "215.0"))
 
-# Once the loss leg is closed and only one leg is running solo,
-# close it if its LTP rises more than this many points above its entry price.
-# i.e. surviving leg is now losing: (current_ltp - entry_price) > SINGLE_LEG_SL
-# Set to 9999 to effectively disable.
-SINGLE_LEG_SL          = float(os.getenv("SINGLE_LEG_SL",           "10.0"))
+SINGLE_LEG_SL          = float(os.getenv("SINGLE_LEG_SL",          "10.0"))
+
+# ---------------------------------------------------------------
+# v3: Profit target + trailing stop (per LOT basis)
+# ---------------------------------------------------------------
+PROFIT_PER_LOT  = float(os.getenv("PROFIT_PER_LOT",  "1000.0"))
+TRAIL_PROFIT    = float(os.getenv("TRAIL_PROFIT",      "500.0"))
+
+if PROFIT_PER_LOT < 0:
+    raise ValueError("PROFIT_PER_LOT must be >= 0")
+if TRAIL_PROFIT <= 0:
+    raise ValueError("TRAIL_PROFIT must be > 0")
+if TRAIL_PROFIT > PROFIT_PER_LOT:
+    raise ValueError("TRAIL_PROFIT must be <= PROFIT_PER_LOT")
+
+print(f"[CONFIG] PROFIT_PER_LOT={PROFIT_PER_LOT}  TRAIL_PROFIT={TRAIL_PROFIT}")
 
 MARKET_TZ = pytz.timezone("Asia/Kolkata")
 
@@ -154,7 +171,16 @@ def init_db():
             );
             """)
 
-            # v2: added leg, leg_entry, leg_exit_price columns
+            # v4: Add OI change columns if they don't exist yet
+            for col, coltype in [
+                ("ce_oi_change", "BIGINT"),
+                ("pe_oi_change", "BIGINT"),
+            ]:
+                cur.execute(f"""
+                    ALTER TABLE nifty_vwap_minute
+                    ADD COLUMN IF NOT EXISTS {col} {coltype};
+                """)
+
             cur.execute("""
             CREATE TABLE IF NOT EXISTS nifty_vwap_trade (
                 id BIGSERIAL PRIMARY KEY,
@@ -179,11 +205,10 @@ def init_db():
             );
             """)
 
-            # Add v2 columns to existing table if upgrading in place
             for col, coltype in [
-                ("leg",           "TEXT"),
-                ("leg_entry",     "DOUBLE PRECISION"),
-                ("leg_exit_price","DOUBLE PRECISION"),
+                ("leg",            "TEXT"),
+                ("leg_entry",      "DOUBLE PRECISION"),
+                ("leg_exit_price", "DOUBLE PRECISION"),
             ]:
                 cur.execute(f"""
                     ALTER TABLE nifty_vwap_trade
@@ -217,7 +242,7 @@ def is_kill_switch_on() -> bool:
         return True
 
 init_db()
-print("[DB] Tables ready.")
+print("[DB] Tables ready (ce_oi_change + pe_oi_change columns ensured).")
 
 # ============================================================
 # BROKER INIT
@@ -408,7 +433,9 @@ def log_trade(event, phase, expiry_tag, expiry_date, strike,
 def log_vwap(event, phase, spot,
              expiry_tag=None, expiry_date=None,
              strike=None, ltp=None, vwap=None, cum_pv=None, cum_vol=None,
-             ce_vol=None, pe_vol=None, ce_ltp=None, pe_ltp=None, note=""):
+             ce_vol=None, pe_vol=None, ce_ltp=None, pe_ltp=None,
+             ce_oi_change=None, pe_oi_change=None,
+             note=""):
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -419,14 +446,18 @@ def log_vwap(event, phase, spot,
                         strike, straddle_ltp, vwap,
                         cum_pv, cum_vol,
                         ce_vol, pe_vol,
-                        ce_ltp, pe_ltp, note
+                        ce_ltp, pe_ltp,
+                        ce_oi_change, pe_oi_change,
+                        note
                     ) VALUES (
                         %s,%s,%s,%s,
                         %s,%s,
                         %s,%s,%s,
                         %s,%s,
                         %s,%s,
-                        %s,%s,%s
+                        %s,%s,
+                        %s,%s,
+                        %s
                     )
                 """, (
                     now_ist(), phase, event, spot,
@@ -434,14 +465,149 @@ def log_vwap(event, phase, spot,
                     strike, ltp, vwap,
                     cum_pv, cum_vol,
                     ce_vol, pe_vol,
-                    ce_ltp, pe_ltp, note
+                    ce_ltp, pe_ltp,
+                    ce_oi_change, pe_oi_change,
+                    note
                 ))
             conn.commit()
     except Exception as e:
         print(f"[LOG_VWAP_FAIL] {e}")
 
 # ============================================================
-# PRELOCK VWAP OBJECT (unchanged — used only before ATM lock)
+# v4: OI TRACKER
+# ============================================================
+class OITracker:
+    """
+    Tracks cumulative Open Interest change from a baseline snapshot taken at
+    VWAP_START for ±PRELOCK_WING_STRIKES strikes of the CURRENT weekly expiry.
+
+    Usage:
+        tracker = OITracker()
+        tracker.take_baseline(strikes, curr_weekly, opt_index)
+
+        # each minute:
+        ce_chg, pe_chg = tracker.get_oi_change(strike, curr_weekly, opt_index)
+        # Returns (None, None) if strike not tracked or quote fails.
+
+    The tracker stores:
+        _baseline: {(strike, "CE"): baseline_oi, (strike, "PE"): baseline_oi, …}
+
+    OI change = current_oi - baseline_oi   (positive = OI added since open)
+    """
+
+    def __init__(self):
+        self._baseline: dict = {}   # {(strike, opt_type): int}
+
+    def take_baseline(self, strikes: list, expiry, opt_index: dict):
+        """
+        Fetch OI for all (strike, CE/PE) pairs and store as baseline.
+        Called once at VWAP_START.
+        """
+        tokens_to_key = {}   # token_int -> (strike, opt_type)
+        for s in strikes:
+            for opt_type in ("CE", "PE"):
+                meta = opt_index.get((expiry, int(s), opt_type))
+                if meta:
+                    token_int = meta[0]
+                    tokens_to_key[token_int] = (s, opt_type)
+
+        if not tokens_to_key:
+            print("[OI_TRACKER] No tokens found for baseline snapshot — OI tracking disabled.")
+            return
+
+        try:
+            q = safe_quote(list(tokens_to_key.keys()))
+            for token_int, key in tokens_to_key.items():
+                data = q.get(token_int) or q.get(str(token_int))
+                if data:
+                    oi = data.get("oi", 0) or 0
+                    self._baseline[key] = int(oi)
+                else:
+                    self._baseline[key] = 0
+            print(f"[OI_TRACKER] Baseline snapshot taken for {len(self._baseline)//2} strikes "
+                  f"({len(self._baseline)} legs). Expiry={expiry}")
+        except Exception as e:
+            print(f"[OI_TRACKER] Baseline snapshot failed: {e} — OI tracking disabled.")
+
+    def get_oi_change(self, strike: int, expiry, opt_index: dict):
+        """
+        Fetch current OI for a single strike and return (ce_oi_change, pe_oi_change).
+        Returns (None, None) if baseline not available or quote fails.
+        """
+        if not self._baseline:
+            return None, None
+
+        results = {}
+        for opt_type in ("CE", "PE"):
+            key = (strike, opt_type)
+            if key not in self._baseline:
+                results[opt_type] = None
+                continue
+            meta = opt_index.get((expiry, int(strike), opt_type))
+            if not meta:
+                results[opt_type] = None
+                continue
+            try:
+                q = safe_quote([meta[0]])
+                data = list(q.values())[0]
+                current_oi = int(data.get("oi", 0) or 0)
+                results[opt_type] = current_oi - self._baseline[key]
+            except Exception as e:
+                print(f"[OI_TRACKER] get_oi_change failed for {strike}{opt_type}: {e}")
+                results[opt_type] = None
+
+        return results.get("CE"), results.get("PE")
+
+    def get_oi_change_batch(self, strikes: list, expiry, opt_index: dict):
+        """
+        Fetch OI for multiple strikes in a single quote call.
+        Returns dict: {strike: (ce_oi_change, pe_oi_change)}
+        """
+        if not self._baseline:
+            return {s: (None, None) for s in strikes}
+
+        # Build token → (strike, opt_type) map
+        token_map = {}
+        for s in strikes:
+            for opt_type in ("CE", "PE"):
+                key = (s, opt_type)
+                if key in self._baseline:
+                    meta = opt_index.get((expiry, int(s), opt_type))
+                    if meta:
+                        token_map[meta[0]] = (s, opt_type)
+
+        if not token_map:
+            return {s: (None, None) for s in strikes}
+
+        try:
+            q = safe_quote(list(token_map.keys()))
+        except Exception as e:
+            print(f"[OI_TRACKER] batch quote failed: {e}")
+            return {s: (None, None) for s in strikes}
+
+        # Parse results
+        current_oi: dict = {}   # {(strike, opt_type): int}
+        for token_int, (s, opt_type) in token_map.items():
+            data = q.get(token_int) or q.get(str(token_int))
+            if data:
+                current_oi[(s, opt_type)] = int(data.get("oi", 0) or 0)
+
+        out = {}
+        for s in strikes:
+            ce_chg = None
+            pe_chg = None
+            ce_key = (s, "CE")
+            pe_key = (s, "PE")
+            if ce_key in self._baseline and ce_key in current_oi:
+                ce_chg = current_oi[ce_key] - self._baseline[ce_key]
+            if pe_key in self._baseline and pe_key in current_oi:
+                pe_chg = current_oi[pe_key] - self._baseline[pe_key]
+            out[s] = (ce_chg, pe_chg)
+        return out
+
+
+# ============================================================
+# PRELOCK VWAP OBJECT (unchanged)
 # ============================================================
 class StraddleVWAP:
     def __init__(self, strike, expiry_date, expiry_tag, ce_token, pe_token, ce_symbol, pe_symbol):
@@ -489,7 +655,7 @@ class StraddleVWAP:
 
 
 # ============================================================
-# ACTIVE STRADDLE MANAGER (post-lock — v2 logic)
+# ACTIVE STRADDLE MANAGER (post-lock — v3 with trailing stop)
 # ============================================================
 class ActiveStraddleManager:
     """
@@ -506,6 +672,13 @@ class ActiveStraddleManager:
         - Re-entry (one leg closed): straddle crosses below vwap -> re-add closed leg
         - Re-entry (both legs closed, not hard-stopped): straddle crosses below vwap
           -> re-enter both legs (crossover still required)
+
+    v3 — Trailing profit stop (per-lot basis):
+        - trail_activation  = PROFIT_PER_LOT  × num_lots
+        - trail_step        = TRAIL_PROFIT     × num_lots
+        - Once total PnL >= trail_activation, trailing is armed.
+        - On every candle: if trailing is armed and total_pnl drops to/below trail_floor
+          → close ALL open legs immediately (TRAIL_STOP exit).
     """
 
     def __init__(self, strike, expiry_date, expiry_tag,
@@ -518,36 +691,41 @@ class ActiveStraddleManager:
         self.ce_symbol   = ce_symbol
         self.pe_symbol   = pe_symbol
 
-        # VWAP (volume-weighted, seeded from prelock object after lock)
+        self.num_lots = max(1, int(os.getenv("NUM_LOTS", "1")))
+
+        self._trail_activation = PROFIT_PER_LOT * self.num_lots
+        self._trail_step       = TRAIL_PROFIT    * self.num_lots
+
         self.last_ce_vol = None
         self.last_pe_vol = None
         self.cum_pv  = 0.0
         self.cum_vol = 0.0
 
-        # Entry state machine
-        self.entry_state = "UNARMED"   # UNARMED | ARMED | ENTERED
+        self.entry_state = "UNARMED"
 
-        # Per-leg state
         self.ce_open        = False
         self.pe_open        = False
-        self.ce_entry_price = None   # CE LTP at time of sell
-        self.pe_entry_price = None   # PE LTP at time of sell
+        self.ce_entry_price = None
+        self.pe_entry_price = None
         self.ce_realized    = 0.0
         self.pe_realized    = 0.0
 
-        # Which leg is currently closed after a partial exit (for re-entry)
-        self.partial_closed_leg = None   # "CE" | "PE" | None
+        self.partial_closed_leg = None
 
-        # Hard-stopped: no further action
         self.hard_stopped = False
 
-        # For crossover detection (was previous candle close above vwap?)
         self.prev_close_above = None
 
-        # Total entries taken (both legs count as 1 entry)
         self.entries_taken = 0
 
-    # ---------------------------------------------------------------- quote
+        self.trail_armed  = False
+        self.trail_floor  = None
+        self.peak_pnl     = None
+
+        print(f"[TRAIL] num_lots={self.num_lots}  "
+              f"activation=₹{self._trail_activation:.0f}  "
+              f"step=₹{self._trail_step:.0f}")
+
     def quote(self):
         q = safe_quote([self.ce_token, self.pe_token])
         v = {d["instrument_token"]: d for d in q.values()}
@@ -555,7 +733,6 @@ class ActiveStraddleManager:
         pe = v[self.pe_token]
         return ce["last_price"], pe["last_price"], ce["volume"], pe["volume"]
 
-    # ---------------------------------------------------------------- vwap
     def _update_vwap(self, straddle, ce_v, pe_v):
         d_ce = 0 if self.last_ce_vol is None else max(0, ce_v - self.last_ce_vol)
         d_pe = 0 if self.last_pe_vol is None else max(0, pe_v - self.last_pe_vol)
@@ -570,7 +747,6 @@ class ActiveStraddleManager:
 
         return self.cum_pv / self.cum_vol if self.cum_vol > 0 else None
 
-    # ---------------------------------------------------------------- pnl helpers
     def _pnl_leg(self, leg: str, ce_ltp: float, pe_ltp: float) -> float:
         if leg == "CE":
             if not self.ce_open or self.ce_entry_price is None:
@@ -590,9 +766,47 @@ class ActiveStraddleManager:
     def status_str(self):
         ce = "OPEN" if self.ce_open else "CLOSED"
         pe = "OPEN" if self.pe_open else "CLOSED"
-        return f"{self.entry_state} CE={ce} PE={pe}"
+        trail_info = ""
+        if self.trail_armed:
+            trail_info = f" TRAIL_FLOOR=₹{self.trail_floor:.0f}"
+        return f"{self.entry_state} CE={ce} PE={pe}{trail_info}"
 
-    # ---------------------------------------------------------------- order helpers
+    def _update_trail(self, total_pnl: float) -> bool:
+        if not self.trail_armed:
+            if total_pnl >= self._trail_activation:
+                self.trail_armed = True
+                self.peak_pnl   = total_pnl
+                self.trail_floor = self._trail_activation - self._trail_step
+                print(f"[TRAIL_ARMED] {ts()} total_pnl=₹{total_pnl:.2f} "
+                      f"activation=₹{self._trail_activation:.0f} "
+                      f"initial_floor=₹{self.trail_floor:.0f}")
+                log_trade("TRAIL_ARMED", "locked",
+                          self.expiry_tag, self.expiry_date, self.strike,
+                          total_pnl=total_pnl,
+                          note=f"Trailing activated. floor=₹{self.trail_floor:.0f} "
+                               f"step=₹{self._trail_step:.0f}")
+            return False
+
+        if total_pnl > self.peak_pnl:
+            self.peak_pnl = total_pnl
+            steps = int((self.peak_pnl - self._trail_activation) / self._trail_step)
+            new_floor = (self._trail_activation - self._trail_step) + steps * self._trail_step
+            if new_floor > self.trail_floor:
+                old_floor = self.trail_floor
+                self.trail_floor = new_floor
+                print(f"[TRAIL_RATCHET] {ts()} peak=₹{self.peak_pnl:.2f} "
+                      f"floor moved ₹{old_floor:.0f} → ₹{self.trail_floor:.0f}")
+                log_trade("TRAIL_RATCHET", "locked",
+                          self.expiry_tag, self.expiry_date, self.strike,
+                          total_pnl=total_pnl,
+                          note=f"Trail floor ₹{old_floor:.0f}→₹{self.trail_floor:.0f} "
+                               f"peak=₹{self.peak_pnl:.2f}")
+
+        if total_pnl <= self.trail_floor:
+            return True
+
+        return False
+
     def _open_leg(self, leg: str, ce_ltp: float, pe_ltp: float,
                   vwap: float, phase: str, reason: str) -> bool:
         symbol = self.ce_symbol if leg == "CE" else self.pe_symbol
@@ -657,8 +871,8 @@ class ActiveStraddleManager:
                   pnl_realized=leg_pnl, total_pnl=total,
                   ce_ltp=ce_ltp, pe_ltp=pe_ltp,
                   status=self.status_str(), note=f"{reason} {exec_note}")
-        print(f"[CLOSE_LEG {TRADE_MODE}] {ts()} leg={leg} pnl={leg_pnl:.2f} "
-              f"total={total:.2f} reason={reason}")
+        print(f"[CLOSE_LEG {TRADE_MODE}] {ts()} leg={leg} pnl=₹{leg_pnl:.2f} "
+              f"total=₹{total:.2f} reason={reason}")
         return True
 
     def _close_all_open_legs(self, ce_ltp, pe_ltp, vwap, phase, reason):
@@ -667,12 +881,13 @@ class ActiveStraddleManager:
         if self.pe_open:
             self._close_leg("PE", ce_ltp, pe_ltp, vwap, phase, reason)
 
-    # ---------------------------------------------------------------- main per-minute handler
-    def on_minute_close(self, phase: str, trade_allowed: bool = True):
+    def on_minute_close(self, phase: str, trade_allowed: bool = True,
+                        ce_oi_change=None, pe_oi_change=None):
         """
         Called once per minute candle close.
-        trade_allowed=False  -> VWAP still updates, exits/SL still fire,
-                                but NO new entries (initial or re-entry) are placed.
+        ce_oi_change / pe_oi_change: pre-computed OI deltas (passed in from main loop).
+        trade_allowed=False  → VWAP still updates, exits/SL/trail still fire,
+                               but NO new entries are placed.
         Returns (straddle_ltp, vwap, ce_ltp, pe_ltp) or (None, None, None, None) on error.
         """
         if self.hard_stopped:
@@ -709,7 +924,6 @@ class ActiveStraddleManager:
         # ========== ARMED ==========
         if self.entry_state == "ARMED":
             if not above_vwap:
-                # Crossover: above -> below
                 if not trade_allowed:
                     print(f"[ENTRY_BLOCKED] Kill-switch flag=FALSE — crossover detected but entry suppressed")
                 elif self.entries_taken >= MAX_ENTRIES_PER_STRIKE:
@@ -736,9 +950,9 @@ class ActiveStraddleManager:
         if self.entry_state == "ENTERED":
             total = self.pnl_total(ce_ltp, pe_ltp)
 
-            # --- HARD STOP: total PnL breached (check first, before any other logic) ---
+            # PRIORITY 1: HARD STOP
             if total <= MAX_LOSS_LIMIT:
-                print(f"[HARD_SL] {ts()} total={total:.2f} <= limit={MAX_LOSS_LIMIT} — closing all")
+                print(f"[HARD_SL] {ts()} total=₹{total:.2f} <= limit=₹{MAX_LOSS_LIMIT} — closing all")
                 self._close_all_open_legs(ce_ltp, pe_ltp, vwap, phase, "HARD_SL")
                 self.hard_stopped = True
                 log_trade("HARD_SL_DONE", phase, self.expiry_tag, self.expiry_date, self.strike,
@@ -748,10 +962,26 @@ class ActiveStraddleManager:
                           status=self.status_str(), note="Hard stop — all legs closed")
                 return straddle, vwap, ce_ltp, pe_ltp
 
-            # --- SOLO LEG SL: exactly one leg open (other was partially exited) ---
-            # The surviving leg is now naked. Monitor it independently.
-            # If its LTP rises more than SINGLE_LEG_SL above its own entry price,
-            # the market reversed and it is now losing — close it.
+            # PRIORITY 2: TRAILING PROFIT STOP
+            any_open = self.ce_open or self.pe_open
+            if any_open and self._trail_activation > 0:
+                trail_hit = self._update_trail(total)
+                if trail_hit:
+                    print(f"[TRAIL_STOP] {ts()} total=₹{total:.2f} <= "
+                          f"floor=₹{self.trail_floor:.0f} — closing all open legs")
+                    self._close_all_open_legs(ce_ltp, pe_ltp, vwap, phase, "TRAIL_STOP")
+                    self.hard_stopped = True
+                    total_after = self.pnl_total(ce_ltp, pe_ltp)
+                    log_trade("TRAIL_STOP", phase, self.expiry_tag, self.expiry_date, self.strike,
+                              action_price=straddle, vwap_at_action=vwap,
+                              ce_ltp=ce_ltp, pe_ltp=pe_ltp,
+                              total_pnl=total_after,
+                              status=self.status_str(),
+                              note=f"Trail floor=₹{self.trail_floor:.0f} hit. "
+                                   f"peak=₹{self.peak_pnl:.2f} final=₹{total_after:.2f}")
+                    return straddle, vwap, ce_ltp, pe_ltp
+
+            # PRIORITY 3: SOLO LEG SL
             solo_leg = None
             if self.ce_open and not self.pe_open:
                 solo_leg = "CE"
@@ -762,10 +992,9 @@ class ActiveStraddleManager:
                 solo_entry = self.ce_entry_price if solo_leg == "CE" else self.pe_entry_price
                 solo_ltp   = ce_ltp             if solo_leg == "CE" else pe_ltp
                 if solo_entry is not None:
-                    # Positive value means LTP moved above entry → leg is losing
                     leg_drawdown = solo_ltp - solo_entry
                     if leg_drawdown > SINGLE_LEG_SL:
-                        print(f"[SOLO_LEG_SL] {ts()} {solo_leg} solo leg drawdown={leg_drawdown:.2f} "
+                        print(f"[SOLO_LEG_SL] {ts()} {solo_leg} drawdown=₹{leg_drawdown:.2f} "
                               f"> SL={SINGLE_LEG_SL} (entry={solo_entry:.2f} ltp={solo_ltp:.2f}) — closing")
                         ok = self._close_leg(solo_leg, ce_ltp, pe_ltp, vwap, phase, "SOLO_LEG_SL")
                         if ok:
@@ -776,11 +1005,11 @@ class ActiveStraddleManager:
                                       ce_ltp=ce_ltp, pe_ltp=pe_ltp,
                                       total_pnl=self.pnl_total(ce_ltp, pe_ltp),
                                       status=self.status_str(),
-                                      note=f"Solo leg SL hit: drawdown={leg_drawdown:.2f} > {SINGLE_LEG_SL}")
+                                      note=f"Solo leg SL hit: drawdown=₹{leg_drawdown:.2f} > {SINGLE_LEG_SL}")
                         self.prev_close_above = above_vwap
                         return straddle, vwap, ce_ltp, pe_ltp
 
-            # --- PARTIAL EXIT: straddle above vwap + buffer, BOTH legs open ---
+            # PRIORITY 4: PARTIAL EXIT
             if straddle > (vwap + EXIT_WINDOW_ABOVE) and self.ce_open and self.pe_open:
                 ce_loss = ce_ltp - (self.ce_entry_price or ce_ltp)
                 pe_loss = pe_ltp - (self.pe_entry_price or pe_ltp)
@@ -799,14 +1028,13 @@ class ActiveStraddleManager:
                               status=self.status_str(),
                               note=f"Closed loss leg={loss_leg}, profit leg stays open")
 
-            # --- RE-ENTRY LOGIC ---
+            # PRIORITY 5: RE-ENTRY LOGIC
             elif (not above_vwap) and self.prev_close_above:
 
-                # Case A: one leg was partially closed — re-add it
                 if self.partial_closed_leg is not None:
                     reopen_leg = self.partial_closed_leg
                     if not trade_allowed:
-                        print(f"[RE_ENTRY_BLOCKED] Kill-switch flag=FALSE — crossover detected but {reopen_leg} re-entry suppressed")
+                        print(f"[RE_ENTRY_BLOCKED] Kill-switch — {reopen_leg} re-entry suppressed")
                     elif self.entries_taken < MAX_ENTRIES_PER_STRIKE:
                         print(f"[RE_ENTRY_ONE_LEG] {ts()} re-adding {reopen_leg} "
                               f"straddle={straddle:.2f} crossed below vwap={vwap:.2f}")
@@ -824,10 +1052,9 @@ class ActiveStraddleManager:
                     else:
                         print(f"[RE_ENTRY_SKIP] max entries={MAX_ENTRIES_PER_STRIKE} reached")
 
-                # Case B: both legs closed (not hard-stopped) — re-enter both
                 elif not self.ce_open and not self.pe_open and not self.hard_stopped:
                     if not trade_allowed:
-                        print(f"[RE_ENTRY_BOTH_BLOCKED] Kill-switch flag=FALSE — crossover detected but both-leg re-entry suppressed")
+                        print(f"[RE_ENTRY_BOTH_BLOCKED] Kill-switch — both-leg re-entry suppressed")
                     elif self.entries_taken < MAX_ENTRIES_PER_STRIKE:
                         print(f"[RE_ENTRY_BOTH] {ts()} both legs closed, "
                               f"straddle crossed below vwap={vwap:.2f} — re-entering both")
@@ -850,7 +1077,6 @@ class ActiveStraddleManager:
 
         return straddle, vwap, ce_ltp, pe_ltp
 
-    # ---------------------------------------------------------------- EOD / kill-switch close
     def close_all_now(self, phase: str, reason: str = "EOD_CLOSE"):
         """Force-close all open legs immediately."""
         if self.hard_stopped:
@@ -863,15 +1089,15 @@ class ActiveStraddleManager:
         vwap = self.cum_pv / self.cum_vol if self.cum_vol > 0 else None
         self._close_all_open_legs(ce_ltp, pe_ltp, vwap, phase, reason)
         total = self.pnl_total(ce_ltp, pe_ltp)
-        print(f"[{reason}] {ts()} ce_realized={self.ce_realized:.2f} "
-              f"pe_realized={self.pe_realized:.2f} total={total:.2f}")
+        print(f"[{reason}] {ts()} ce_realized=₹{self.ce_realized:.2f} "
+              f"pe_realized=₹{self.pe_realized:.2f} total=₹{total:.2f}")
 
 
 # ============================================================
 # MAIN
 # ============================================================
 def main():
-    print("[INIT] Starting VWAP Straddle v2 (Railway) — crossover entry + per-leg exit …")
+    print("[INIT] Starting VWAP Straddle v4 (Railway) — crossover entry + per-leg exit + trail stop + OI tracking …")
 
     while now_ist().time() < VWAP_START:
         time.sleep(0.5)
@@ -895,6 +1121,13 @@ def main():
 
     print(f"[PRELOCK] Base ATM={base_atm}  range {min(strikes)}..{max(strikes)}")
 
+    # --------------------------------------------------------
+    # v4: Initialise OI tracker and take baseline snapshot
+    # --------------------------------------------------------
+    oi_tracker = OITracker()
+    oi_tracker.take_baseline(strikes, curr_weekly, opt_index)
+    # (OI is only tracked for CURRENT week expiry per the spec)
+
     prelock_objs = {"CURR_WEEK": {}, "NEXT_WEEK": {}}
     for s in strikes:
         meta_c = get_option_pair_for_strike_fast(s, curr_weekly, opt_index)
@@ -912,15 +1145,10 @@ def main():
     active_tag    = None
     active_expiry = None
     atm_locked    = None
-    last_min      = None       # tracks which minute we last processed
+    last_min      = None
 
-    # Kill-switch state — tracked across loop iterations so we don't
-    # repeatedly attempt to close already-closed positions.
-    kill_positions_closed = False   # True once we've successfully closed all legs due to flag=False
+    kill_positions_closed = False
 
-    # How many seconds past the minute boundary to wait before sampling.
-    # This ensures we read the settled candle-close LTP, not a spike
-    # that happened right at the boundary and already reversed.
     CANDLE_CLOSE_DELAY_SECS = int(os.getenv("CANDLE_CLOSE_DELAY_SECS", "5"))
 
     # ============================================================
@@ -932,22 +1160,15 @@ def main():
         curr_sec = now.second
 
         # ---- KILL SWITCH ----
-        # Check DB flag every tick (cheap read).
-        # Behaviour:
-        #   flag=False + open positions  -> close all open legs immediately (retry until done)
-        #   flag=False + no open positions -> block all new entries, keep looping + logging
-        #   flag=True  -> normal operation; if it was previously False, entries can resume
         trade_allowed = is_kill_switch_on()
 
         if not trade_allowed:
-            # --- Close any open positions (only attempt if not already done) ---
             if active is not None and not kill_positions_closed:
                 any_open = active.ce_open or active.pe_open
                 if any_open:
                     print(f"[KILL SWITCH] flag=FALSE — closing all open legs …")
                     try:
                         active.close_all_now(phase, reason="FLAG_EXIT")
-                        # Check if all legs are actually closed now
                         if not active.ce_open and not active.pe_open:
                             kill_positions_closed = True
                             print("[KILL SWITCH] All positions closed successfully.")
@@ -955,7 +1176,6 @@ def main():
                                       status="FORCED_EXIT",
                                       note="All legs closed — kill-switch flag=FALSE")
                         else:
-                            # Partial failure — will retry next tick
                             print("[KILL SWITCH] Some legs still open after close attempt — will retry.")
                             log_trade("FLAG_EXIT_PARTIAL", phase, active_tag or "NA", active_expiry, atm_locked,
                                       status="FORCED_EXIT_PARTIAL",
@@ -966,7 +1186,6 @@ def main():
                                   status="FORCED_EXIT_FAIL",
                                   note=f"Kill-switch close failed: {e} — retrying")
                 else:
-                    # No open positions — just mark as done
                     kill_positions_closed = True
                     print("[KILL SWITCH] flag=FALSE — no open positions. Entries blocked.")
                     log_trade("FLAG_BLOCK", phase, active_tag or "NA", active_expiry, atm_locked,
@@ -980,12 +1199,9 @@ def main():
                           status="ENTRY_BLOCKED",
                           note="Kill-switch flag=FALSE in pre-lock — entries blocked")
 
-            # --- Skip all trading logic this tick ---
             time.sleep(1)
             continue
 
-        # flag is True here — reset closure tracker so re-entry can happen
-        # if flag was temporarily toggled and positions were closed
         if trade_allowed and kill_positions_closed:
             print("[KILL SWITCH] flag restored to TRUE — entries re-enabled.")
             log_trade("FLAG_RESTORED", phase, active_tag or "NA", active_expiry, atm_locked,
@@ -1001,20 +1217,33 @@ def main():
             time.sleep(1)
             continue
 
-        # ---- PRELOCK: update once per minute, after candle close delay ----
+        # ---- PRELOCK: update once per minute ----
         if not did_lock:
             if last_min != curr_min and curr_sec >= CANDLE_CLOSE_DELAY_SECS:
                 last_min = curr_min
+
+                # v4: fetch OI changes for ALL prelock strikes in one batch call
+                oi_changes = oi_tracker.get_oi_change_batch(strikes, curr_weekly, opt_index)
+
                 for tag in ("CURR_WEEK", "NEXT_WEEK"):
                     for s, obj in prelock_objs[tag].items():
                         ltp, vwap, cum_pv, cum_vol, ce_v, pe_v, ce_ltp, pe_ltp = obj.update()
+
+                        # OI changes are tracked against CURR_WEEK baseline regardless of tag
+                        ce_oi_chg, pe_oi_chg = oi_changes.get(s, (None, None))
+
                         log_vwap("PRELOCK_VWAP", phase, spot,
                                  expiry_tag=tag, expiry_date=obj.expiry_date,
                                  strike=s, ltp=ltp, vwap=vwap,
                                  cum_pv=cum_pv, cum_vol=cum_vol,
                                  ce_vol=ce_v, pe_vol=pe_v,
                                  ce_ltp=ce_ltp, pe_ltp=pe_ltp,
+                                 ce_oi_change=ce_oi_chg, pe_oi_change=pe_oi_chg,
                                  note="prelock tracking")
+
+                        if ce_oi_chg is not None or pe_oi_chg is not None:
+                            print(f"[OI] {ts()} {tag} strike={s} "
+                                  f"ce_oi_chg={ce_oi_chg} pe_oi_chg={pe_oi_chg}")
 
             if now.time() < ATM_LOCK_TIME:
                 time.sleep(1)
@@ -1046,7 +1275,7 @@ def main():
                 ce_token=chosen_prelock.ce_token, pe_token=chosen_prelock.pe_token,
                 ce_symbol=chosen_prelock.ce_symbol, pe_symbol=chosen_prelock.pe_symbol
             )
-            # Seed VWAP state from prelock so continuity is preserved
+            # Seed VWAP state from prelock for continuity
             active.cum_pv      = chosen_prelock.cum_pv
             active.cum_vol     = chosen_prelock.cum_vol
             active.last_ce_vol = chosen_prelock.last_ce_vol
@@ -1059,27 +1288,51 @@ def main():
             last_min = None
 
             note = (f"ATM_LOCK={atm_locked} curr_prem={ltp_curr:.2f} th={PREMIUM_SWITCH_TH:.2f} "
-                    f"-> TRADE={active_tag} expiry={active_expiry} MODE={TRADE_MODE}")
+                    f"-> TRADE={active_tag} expiry={active_expiry} MODE={TRADE_MODE} "
+                    f"num_lots={active.num_lots} trail_activation=₹{active._trail_activation:.0f} "
+                    f"trail_step=₹{active._trail_step:.0f}")
             log_trade("ATM_LOCK", phase, active_tag, active_expiry, atm_locked,
                       action_price=ltp_curr, vwap_at_action=vwap_curr, note=note)
             print(f"[LOCK] {ts()} {note}")
 
-        # ---- POST-LOCK: process once per minute, after candle close delay ----
+        # ---- POST-LOCK: process once per minute ----
         if did_lock and (last_min != curr_min) and curr_sec >= CANDLE_CLOSE_DELAY_SECS:
             last_min = curr_min
 
-            straddle, vwap, ce_ltp, pe_ltp = active.on_minute_close(phase, trade_allowed=trade_allowed)
+            # v4: fetch OI change for the LOCKED strike only
+            ce_oi_chg, pe_oi_chg = oi_tracker.get_oi_change(
+                atm_locked, curr_weekly, opt_index
+            )
+
+            straddle, vwap, ce_ltp, pe_ltp = active.on_minute_close(
+                phase,
+                trade_allowed=trade_allowed,
+                ce_oi_change=ce_oi_chg,
+                pe_oi_change=pe_oi_chg,
+            )
 
             if straddle is not None and vwap is not None:
                 run_pnl   = active.pnl_running(ce_ltp, pe_ltp)
                 total_pnl = active.pnl_total(ce_ltp, pe_ltp)
+
+                trail_note = ""
+                if active.trail_armed:
+                    trail_note = (f" | TRAIL armed peak=₹{active.peak_pnl:.2f} "
+                                  f"floor=₹{active.trail_floor:.0f}")
+
+                oi_note = ""
+                if ce_oi_chg is not None or pe_oi_chg is not None:
+                    oi_note = f" | OI_chg CE={ce_oi_chg} PE={pe_oi_chg}"
+                    print(f"[OI] {ts()} locked strike={atm_locked} "
+                          f"ce_oi_chg={ce_oi_chg} pe_oi_chg={pe_oi_chg}")
 
                 log_vwap("VWAP_ROW", phase, spot,
                          expiry_tag=active_tag, expiry_date=active_expiry,
                          strike=atm_locked, ltp=straddle, vwap=vwap,
                          cum_pv=active.cum_pv, cum_vol=active.cum_vol,
                          ce_ltp=ce_ltp, pe_ltp=pe_ltp,
-                         note=f"state={active.entry_state} {active.status_str()} MODE={TRADE_MODE}")
+                         ce_oi_change=ce_oi_chg, pe_oi_change=pe_oi_chg,
+                         note=f"state={active.entry_state} {active.status_str()} MODE={TRADE_MODE}{trail_note}{oi_note}")
 
                 log_trade("HEARTBEAT", phase, active_tag, active_expiry, atm_locked,
                           action_price=straddle, vwap_at_action=vwap,
@@ -1087,7 +1340,7 @@ def main():
                           total_pnl=total_pnl,
                           ce_ltp=ce_ltp, pe_ltp=pe_ltp,
                           status=active.status_str(),
-                          note=f"entries={active.entries_taken} MODE={TRADE_MODE}")
+                          note=f"entries={active.entries_taken} MODE={TRADE_MODE}{trail_note}{oi_note}")
 
         time.sleep(1)
 
