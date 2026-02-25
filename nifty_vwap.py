@@ -272,7 +272,7 @@ def safe_quote(keys, max_retries=5, base_sleep=1.0):
 # TIME / UTILS
 # ============================================================
 def now_ist():
-    return datetime.now(MARKET_TZ)
+    return datetime.now(MARKET_TZ).replace(microsecond=0)
 
 def ts():
     return now_ist().strftime("%Y-%m-%d %H:%M:%S")
